@@ -19,11 +19,13 @@
 * Create map dir: `mkdir -p ../map`
 
 ### Create backup of references
+
 ```sh
 git for-each-ref > "$tempdir/backup-refs"
 ```
-`go-get` version:
-```go
+
+`go-git` version:
+```golang
 worktree := ...
 r, err := gogit.Repository.Open("", worktree)
 if err != nil {
@@ -42,6 +44,7 @@ i.ForEach(func(r *pumbling.Reference) error {
 ```
 
 ### Resume work
+
 Check state branch:
 ```sh
 git rev-parse --no-flags --revs-only $state_branch`
@@ -51,22 +54,23 @@ if success {
 ```
 
 ### Generate parse list
+
 generate head HASH example:
-```
+```sh
 for each HEAD:
     git rev-parse --no-flags --revs-only --symbolic-full-name --default HEAD
     git rev-parse --verify HEAD^0 >> $(pwd)/../heads
 ```
 
 get the parse revs:
-```
+```sh
 git rev-parse --revs-only "$@" > ../parse
 ```
 
 
 ### Test the subdirectory filter
 
-```
+```sh
 git rev-list --sq --no-revs "$@" -- $filter_subdir
 ```
 Then, needs index: `need_index=t`
@@ -85,7 +89,7 @@ commits=$(wc -l < ../revs | tr -d " ")
 Iterate though each revision in `../revs`, write output to `../commit`.
 
 `$commit:$filter_subdir` is a _git tree-ish_
-```
+```sh
 for commit,parents in < ../revs :
     GIT_ALLOW_NULL_SHA1=1
     # Read the commit object into the index based on the tree-ish
@@ -122,7 +126,7 @@ for commit,parents in < ../revs :
 
 Must filter non-existant commits and fix references
 
-```
+```sh
 for each ref in <heads:
     sha1=git rev-parse $ref
     if !../map/sha1 {
@@ -133,7 +137,7 @@ for each ref in <heads:
 ```
 
 Update the refs
-```
+```sh
 foreach ref in ../heads
     sha1 = git rev-parse $ref
     rewritten = map $sha1
@@ -153,7 +157,7 @@ foreach ref in ../heads
 
 ### save state branch
 
-```
+```sh
 with open(../map):
     # generate state blob
     # save state to filter.map
@@ -163,7 +167,7 @@ with open(../map):
 
 ### validate
 
-```
+```sh
 git read-tree -u -m HEAD
 ```
 
