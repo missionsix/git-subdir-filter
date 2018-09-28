@@ -2,7 +2,8 @@ package main
 
 import (
     "context"
-    //"flag"
+    "error"
+    "flag"
     "fmt"
     //    "log"
     //    "net"
@@ -12,16 +13,19 @@ import (
     "syscall"
 
     "github.com/caarlos0/env"
+    //    "gopkg.in/src-d/go-git.v4"
 )
 
 type Config struct {
-    WorkDir      string `env:"FILTER_DIR" envDefault:"${PWD}/work" envExpand:"true"`
-    SourceDir    string `env:"SOURCE_DIR" envDefault:"${PWD}/work/source" envExpand:"true"`
-    SourceRepo   string `env:"SOURCE_REPO"`
-    SourceBranch string `env:"SOURCE_BRANCH"`
-    TargetRepo   string `env:"SOURCE_REPO"`
-    TargetBranch string `env:"TARGET_BRANCH"`
-    TargetDir    string `env:"TARGET_DIR" envDefault:"${PWD}/target/source" envExpand:"true"`
+    WorkDir         string `env:"FILTER_DIR" envDefault:"${PWD}/work" envExpand:"true"`
+    SourceDir       string
+    StageDir        string
+    TargetDir       string
+    SourceRepo      string `env:"SOURCE_REPO"`
+    SourceBranch    string `env:"SOURCE_BRANCH"`
+    TargetRepo      string `env:"SOURCE_REPO"`
+    TargetBranch    string `env:"TARGET_BRANCH"`
+    FilterDirectory string
 }
 
 func SignalHandler(ctx context.Context, cancel context.CancelFunc, wg *sync.WaitGroup) {
@@ -44,15 +48,60 @@ func SignalHandler(ctx context.Context, cancel context.CancelFunc, wg *sync.Wait
     }()
 }
 
+func setupEnvironment(cfg *Config) error {
+
+    srepo := flag.String("source-repo", "", "Source git repository (required)")
+    trepo := flag.String("target-repo", "", "Target git repository (required)")
+    sbranch := flag.String("source-branch", "", "Source git branch (required)")
+    tbranch := flag.String("target-branch", "", "Target git branch (required)")
+    fdir := flag.String("filter-dir", "", "Filter Directory (required)")
+
+    // Parse environment
+    err := env.Parse(&cfg)
+    if err != nil {
+        return err
+    }
+
+    // flags override environment
+    flag.Parse()
+
+    // verify required flags
+    if *srepo == "" {
+        return error("--source-repo is required")
+    }
+    if *trepo == "" {
+        return error("--target-repo is required")
+    }
+    if *sbranch == "" {
+        return error("--source-branch is required")
+    }
+    if *tbranch == "" {
+        return error("--target-branch is required")
+    }
+    if *fdir == "" {
+        return error("--filter-dir is required")
+    }
+
+    // set paths
+    //cfg.
+}
+
+func usage(err error) {
+    fmt.Fprintf(os.Stderr, "%+v\n", err)
+
+    flag.PrintDefaults()
+
+    os.Exit(1)
+}
+
 func main() {
     var wg sync.WaitGroup
 
     cfg := Config{}
 
-    //flag.Parse()
-    err := env.Parse(&cfg)
+    err := setupEnvironment(&cfg)
     if err != nil {
-        fmt.Fprintf(os.Stderr, "%+v\n", err)
+        usage(err)
     }
 
     // Setup runtime context
