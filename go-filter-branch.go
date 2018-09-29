@@ -2,17 +2,16 @@ package main
 
 import (
     "context"
-    "error"
+    "errors"
     "flag"
     "fmt"
     //    "log"
     //    "net"
+    "github.com/caarlos0/env"
     "os"
     "os/signal"
     "sync"
     "syscall"
-
-    "github.com/caarlos0/env"
     //    "gopkg.in/src-d/go-git.v4"
 )
 
@@ -57,7 +56,7 @@ func setupEnvironment(cfg *Config) error {
     fdir := flag.String("filter-dir", "", "Filter Directory (required)")
 
     // Parse environment
-    err := env.Parse(&cfg)
+    err := env.Parse(cfg)
     if err != nil {
         return err
     }
@@ -67,23 +66,46 @@ func setupEnvironment(cfg *Config) error {
 
     // verify required flags
     if *srepo == "" {
-        return error("--source-repo is required")
+        return errors.New("--source-repo is required")
     }
     if *trepo == "" {
-        return error("--target-repo is required")
+        return errors.New("--target-repo is required")
     }
     if *sbranch == "" {
-        return error("--source-branch is required")
+        return errors.New("--source-branch is required")
     }
     if *tbranch == "" {
-        return error("--target-branch is required")
+        return errors.New("--target-branch is required")
     }
     if *fdir == "" {
-        return error("--filter-dir is required")
+        return errors.New("--filter-dir is required")
     }
 
+    cfg.SourceRepo = srepo
+    cfg.SourceRepo = srepo
+
     // set paths
-    //cfg.
+    if cfg.SourceDir == "" {
+        cfg.SourceDir = "source"
+    }
+    if cfg.TargetDir == "" {
+        cfg.TargetDir = "target"
+    }
+    if cfg.StageDir == "" {
+        cfg.StageDir = "stage"
+    }
+
+    fmt.Println("Working Directory: ", cfg.WorkDir)
+
+    fmt.Println("Source Repository: ", cfg.SourceRepo)
+    fmt.Println("Source Branch: ", cfg.SourceBranch)
+    fmt.Println("Target Repository: ", cfg.TargetRepo)
+    fmt.Println("Target Branch: ", cfg.TargetBranch)
+    fmt.Println("Source Tree: ", cfg.SourceDir)
+    fmt.Println("Target Tree: ", cfg.TargetDir)
+    fmt.Println("Stage Tree: ", cfg.StageDir)
+
+    return nil
 }
 
 func usage(err error) {
@@ -107,8 +129,6 @@ func main() {
     // Setup runtime context
     ctx, cancelContexts := context.WithCancel(context.Background())
     SignalHandler(ctx, cancelContexts, &wg)
-
-    fmt.Println("working...")
 
     // finished work.
     cancelContexts()
