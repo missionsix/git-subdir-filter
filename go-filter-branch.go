@@ -87,7 +87,7 @@ func initSourceRepo(bgctx context.Context, cfg *Config) (*git.Repository, error)
     err = repo.FetchContext(ctx, &git.FetchOptions{
         RemoteName: "origin",
         RefSpecs:   []gitconfig.RefSpec{gitconfig.RefSpec(refspec)},
-        Progress:   os.Stdout,
+        Progress:   nil,
         Force:      true,
     })
 
