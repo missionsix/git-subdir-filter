@@ -53,10 +53,13 @@ func getRemoteBranch(r *git.Repository, name string, url string) (*git.Remote, e
     return remote, err
 }
 
-func initSourceRepo(ctx context.Context, cfg *Config) (*git.Repository, error) {
+func initSourceRepo(bgctx context.Context, cfg *Config) (*git.Repository, error) {
     var err error
     var repo *git.Repository
     var refspec string
+
+    ctx, cancelContext := context.WithCancel(bgctx)
+    defer cancelContext()
 
     // open the source dir
     path := filepath.Join(cfg.WorkDir, cfg.SourceDir)
@@ -76,11 +79,15 @@ func initSourceRepo(ctx context.Context, cfg *Config) (*git.Repository, error) {
         goto out
     }
 
-    refspec = fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s", cfg.SourceBranch, "origin", cfg.SourceBranch)
+    refspec = fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s",
+        cfg.SourceBranch, "origin", cfg.SourceBranch)
+
+
+    fmt.Println("Synchronizing refs from remote: ", refspec)
     err = repo.FetchContext(ctx, &git.FetchOptions{
         RemoteName: "origin",
         RefSpecs:   []gitconfig.RefSpec{gitconfig.RefSpec(refspec)},
-        Progress:   nil,
+        Progress:   os.Stdout,
         Force:      true,
     })
 
@@ -134,9 +141,9 @@ func buildEnvironment(cfg *Config) error {
 func setupEnvironment(cfg *Config) error {
 
     sourceRepo := flag.String("source-repo", "", "Source git repository (required)")
+    sourceBranch := flag.String("source-branch", "master", "Source git branch (default: master)")
     targetRepo := flag.String("target-repo", "", "Target git repository (required)")
-    sourceBranch := flag.String("source-branch", "", "Source git branch (required)")
-    targetBranch := flag.String("target-branch", "", "Target git branch (required)")
+    targetBranch := flag.String("target-branch", "master", "Target git branch (default: master)")
     filterDir := flag.String("filter-dir", "", "Filter Directory (required)")
 
     // Parse environment
@@ -154,12 +161,6 @@ func setupEnvironment(cfg *Config) error {
     }
     if *targetRepo == "" {
         return errors.New("--target-repo is required")
-    }
-    if *sourceBranch == "" {
-        return errors.New("--source-branch is required")
-    }
-    if *targetBranch == "" {
-        return errors.New("--target-branch is required")
     }
     if *filterDir == "" {
         return errors.New("--filter-dir is required")
@@ -213,6 +214,7 @@ func SignalHandler(ctx context.Context, cancel context.CancelFunc, wg *sync.Wait
         for {
             select {
             case <-ctx.Done():
+                signal.Stop(sigs)
                 fmt.Println("Exiting signal handler")
                 return
             case s := <-sigs:
@@ -224,6 +226,7 @@ func SignalHandler(ctx context.Context, cancel context.CancelFunc, wg *sync.Wait
 }
 
 func main() {
+    var ret int
     var err error
     var wg sync.WaitGroup
 
@@ -247,20 +250,31 @@ func main() {
     // Clone snd sync source repo
     _, err = initSourceRepo(ctx, &cfg)
     if err != nil {
+        if err == git.NoErrAlreadyUpToDate {
+            fmt.Println(err)
+            ret = 0
+            goto out
+        }
         fmt.Fprintf(os.Stderr, "Could not open source repository: %s\n", err)
-        os.Exit(1)
+        ret = 1
+        goto out
     }
+
     _, err = openStage(ctx, &cfg)
     if err != nil {
         fmt.Fprintf(os.Stderr, "Could not open stage directory: %s\n", err)
-        os.Exit(1)
+        ret = 1
+        goto out
     }
 
     // Determine starting point
 
+out:
     // finished work.
     cancelContexts()
 
     // wait for all work to finish
     wg.Wait()
+
+    os.Exit(ret)
 }
