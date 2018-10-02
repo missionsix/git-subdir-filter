@@ -32,6 +32,7 @@ type Config struct {
 func openRepo(path string, bare bool) (*git.Repository, error) {
     var err error
     var repo *git.Repository
+
     // Create the source dir, bare
     repo, err = git.PlainInit(path, bare)
     if err == git.ErrRepositoryAlreadyExists {
@@ -157,13 +158,13 @@ func setupEnvironment(cfg *Config) error {
 
     // verify required flags
     if *sourceRepo == "" {
-        return errors.New("--source-repo is required")
+        return errors.New("-source-repo is required")
     }
     if *targetRepo == "" {
-        return errors.New("--target-repo is required")
+        return errors.New("-target-repo is required")
     }
     if *filterDir == "" {
-        return errors.New("--filter-dir is required")
+        return errors.New("-filter-dir is required")
     }
 
     cfg.SourceRepo = *sourceRepo
@@ -204,16 +205,20 @@ func usage(err error) {
     os.Exit(1)
 }
 
-func SignalHandler(ctx context.Context, cancel context.CancelFunc, wg *sync.WaitGroup) {
+// Global signal handler, cancels the context
+// return cancel func for graceful teardown
+func SignalHandler(ctx context.Context, wg *sync.WaitGroup) context.CancelFunc {
     sigs := make(chan os.Signal, 1)
     signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
+
+    c, cancel := context.WithCancel(ctx)
 
     wg.Add(1)
     go func() {
         defer wg.Done()
         for {
             select {
-            case <-ctx.Done():
+            case <-c.Done():
                 signal.Stop(sigs)
                 fmt.Println("Exiting signal handler")
                 return
@@ -223,6 +228,8 @@ func SignalHandler(ctx context.Context, cancel context.CancelFunc, wg *sync.Wait
             }
         }
     }()
+
+    return cancel
 }
 
 func main() {
@@ -244,10 +251,10 @@ func main() {
     }
 
     // Setup runtime context
-    ctx, cancelContexts := context.WithCancel(context.Background())
-    SignalHandler(ctx, cancelContexts, &wg)
+    ctx := context.Background()
+    cancel := SignalHandler(ctx, &wg)
 
-    // Clone snd sync source repo
+    // Clone and sync source repo
     _, err = initSourceRepo(ctx, &cfg)
     if err != nil {
         if err == git.NoErrAlreadyUpToDate {
@@ -271,7 +278,7 @@ func main() {
 
 out:
     // finished work.
-    cancelContexts()
+    cancel()
 
     // wait for all work to finish
     wg.Wait()
