@@ -6,6 +6,7 @@ repository to another, maintaining synchronization.
 
 ## Requirements
 
+ * libgit.v26
  * Source git repository branch with a subdirectory
  * Read-only protected target repository
 
