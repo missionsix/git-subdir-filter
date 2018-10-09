@@ -171,3 +171,47 @@ with open(../map):
 git read-tree -u -m HEAD
 ```
 
+
+
+## Git2Go
+
+```go
+var repo *git.Repository
+var err error
+
+// Lookup blob by OID
+blob, err := repo.LookupBlob(oid)
+
+// Lookup branch by OID
+branch, err := repo.LookupBranch(oid)
+
+// Lookup commit by OID
+commit, err := repo.LookupCommit(oid)
+
+// Tree lookup
+tree, err := LookupTree(oid)
+
+```
+
+Trees in git are immutable.  Must use the treebuilder
+
+```go
+var repo *git.Repository
+var err error
+
+// empty tree builder
+tb, err := repo.TreeBuilder()
+
+// Walk the current tree
+tree.Walk(func (name string, te *git.TreeEntry) int {
+    tb.Insert(filename, oid, filemode)
+})
+
+tb.Write()
+Tb.Free()
+
+// initialized builder
+tb, err := repo.TreeBuilderFromTree(tree)
+
+
+```
