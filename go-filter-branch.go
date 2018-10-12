@@ -1,3 +1,5 @@
+// Filter Branch
+
 package main
 
 import (
@@ -56,6 +58,8 @@ type commitItem struct {
     Commit *git.Commit
     // Filtered subtree
     FilterTree *git.Tree
+    // Rewritten tree object
+    RewriteTree *git.Tree
     // Rewrite Commit
     Rewrite *git.Commit
 }
@@ -65,11 +69,11 @@ func makeCommit(repo *git.Repository, c *git.Commit, t *git.Tree, p *git.Commit)
     var rewrite *git.Commit
     var oid *git.Oid
 
-	var parents []*git.Commit
-	if p != nil {
-		parents = append(parents, p)
-	}
-	
+    var parents []*git.Commit
+    if p != nil {
+        parents = append(parents, p)
+    }
+
     // rewrite the commit with the subtree
     oid, err = repo.CreateCommit(
         "", // refname
@@ -84,54 +88,76 @@ func makeCommit(repo *git.Repository, c *git.Commit, t *git.Tree, p *git.Commit)
     return rewrite, err
 }
 
-// rewriteCommits starts RUNTIME_WORKERS and waits for them to finish processing
-// commits fed from the commits channel
-func rewriteCommits(ctx context.Context, wg *sync.WaitGroup, rewriteChan <-chan bool) {
+func rewriteCommits(ctx context.Context, wg *sync.WaitGroup) {
+    var parent *git.Commit
+    var count int = 0
 
-    wg.Add(1)
-    go func() {
-        defer wg.Done()
+    repo := ctx.Value(RUNTIME_TARGET_REPO).(*git.Repository)
+    commits := ctx.Value(RUNTIME_COMMIT_TREE).(*commitTree)
 
-        // block
-        <-rewriteChan
+    // Block for synchrous cleanup
+    wg.Wait()
 
-        fmt.Println("Rewriting commits...")
+    fmt.Println("Rewriting commits...")
 
-        repo := ctx.Value(RUNTIME_TARGET_REPO).(*git.Repository)
-        commits := ctx.Value(RUNTIME_COMMIT_TREE).(*commitTree)
-
-        var parent *git.Commit
-		var count int = 0
-        for e := commits.List.Front(); e != nil; e = e.Next() {
-            select {
-            case <-ctx.Done():
-                return
-			default:
-				break
-            }
-            ci := e.Value.(*commitItem)
-			if ci.Commit == nil {
-				continue
-			}
-
-            rewrite, err := makeCommit(repo, ci.Commit, ci.FilterTree, parent)
-            if err != nil {
-                panic(err)
-            }
-            parent = rewrite
-            fmt.Println(count, rewrite.Id())
-			count += 1
+    for e := commits.List.Front(); e != nil; e = e.Next() {
+        select {
+        case <-ctx.Done():
+            return
+        default:
+            break
         }
 
-		if parent != nil {
-			_, err := repo.CreateBranch(SOURCE_WORK_BRANCH, parent, true)
-			if err != nil {
-				fmt.Println("Could not create branch from commit", parent.Id())
-			}
-		}
-    }()
+        ci := e.Value.(*commitItem)
+        if ci.Commit == nil {
+            continue
+        }
 
-    fmt.Println("Rewriter waiting...")
+        rewrite, err := makeCommit(repo, ci.Commit, ci.RewriteTree, parent)
+        if err != nil {
+            panic(err)
+        }
+        parent = rewrite
+        fmt.Println(count, rewrite.Id())
+        count += 1
+    }
+
+    if parent != nil {
+        _, err := repo.CreateBranch(SOURCE_WORK_BRANCH, parent, true)
+        if err != nil {
+            fmt.Println("Could not create branch from commit", parent.Id())
+        }
+    }
+}
+
+func rewriteCommit(ctx context.Context, ci *commitItem) {
+    // recursively build TreeBuilder
+    /*
+     tb, err := TreeBuilder()
+
+    tree.Walk(func(entry string, t *git.TreeEntry) {
+       tb.Insert()
+    })
+     */
+    fmt.Println(ci.Commit.Id())
+}
+
+// rewriteWorker performs the heavy lifting of rewriting the commit tree
+func rewriteWorker(ctx context.Context, wg *sync.WaitGroup, work <-chan *commitItem) {
+
+    defer wg.Done()
+
+    for {
+        select {
+        case <- ctx.Done():
+            return
+        case ci, ok := <-work:
+            if !ok {
+                return
+            }
+            rewriteCommit(ctx, ci)
+        }
+    }
 }
 
 func readTree(repo *git.Repository, tree *git.Tree, filter []string, n int) (*git.Tree, bool) {
@@ -159,7 +185,7 @@ func readTree(repo *git.Repository, tree *git.Tree, filter []string, n int) (*gi
 }
 
 func filterWorker(ctx context.Context, wg *sync.WaitGroup,
-    filterChan <-chan *commitItem) {
+    filterChan <-chan *commitItem, commitChan chan<- *commitItem) {
     var err error
     var tree *git.Tree
 
@@ -190,31 +216,18 @@ func filterWorker(ctx context.Context, wg *sync.WaitGroup,
                 ci.FilterTree = nil
                 continue
             }
+
             ci.FilterTree = tree
+            // non-blocking send the commit item to next worker
+            select {
+            case commitChan <- ci:
+            }
         }
     }
 }
 
 func filterRevisions(ctx context.Context, wg *sync.WaitGroup,
-    filterChan <-chan *commitItem, filterDone chan<- bool) {
-    var workgroup sync.WaitGroup
-
-    workers := ctx.Value(RUNTIME_WORKERS).(int)
-
-    fmt.Printf("Starting %d filter workers...\n", workers)
-
-    workgroup.Add(workers)
-    for i := 0; i < workers; i++ {
-       go filterWorker(ctx, &workgroup, filterChan)
-    }
-
-    // launch routine to synchronize with rewriter
-    go func(workgroup *sync.WaitGroup, filterDone chan<- bool) {
-        workgroup.Wait()
-        fmt.Println("Filtering complete")
-        filterDone <- true
-        defer close(filterDone)
-    }(&workgroup, filterDone)
+    filterChan <-chan *commitItem, commitChan chan<- *commitItem) {
 }
 
 func stageRevisions(ctx context.Context, wg *sync.WaitGroup,
@@ -492,7 +505,7 @@ func main() {
     var wg sync.WaitGroup
     var inputChan chan *git.Commit
     var filterChan chan *commitItem
-    var doneChan chan bool
+    var rewriteChan chan *commitItem
     var source *git.Repository
     var target *git.Repository
     var commits *commitTree
@@ -538,7 +551,6 @@ func main() {
     // Create work structures
     commits = &commitTree {
         List: list.New(),
-//      BTree: btree.New(BTREE_DEGREE),
     }
 
     ctx = context.WithValue(ctx, RUNTIME_SOURCE_REPO, source)
@@ -552,22 +564,29 @@ func main() {
 
     filterChan = make(chan *commitItem, 1000)
 
-    ctx = context.WithValue(ctx, RUNTIME_WORKERS, RUNTIME_WORKERS)
     // Start workers
     stageRevisions(ctx, &wg, inputChan, filterChan)
 
-    doneChan = make(chan bool, 1)
+    rewriteChan = make(chan *commitItem, 1000)
 
     // Strip out the uninteresting commits
-    filterRevisions(ctx, &wg, filterChan, doneChan)
+    fmt.Printf("Starting %d filter workers...\n", RUNTIME_WORKERS)
+
+    wg.Add(RUNTIME_WORKERS)
+    for i := 0; i < RUNTIME_WORKERS; i++ {
+        go filterWorker(ctx, &wg, filterChan, rewriteChan)
+    }
 
     ctx = context.WithValue(ctx, RUNTIME_TARGET_REPO, target)
 
-    // actual work
-    rewriteCommits(ctx, &wg, doneChan)
+    fmt.Printf("Starting %d rewrite  workers...\n", RUNTIME_WORKERS)
+    wg.Add(RUNTIME_WORKERS)
+    for i := 0; i < RUNTIME_WORKERS; i++ {
+        go rewriteWorker(ctx, &wg, rewriteChan)
+    }
 
     // wait for all work to finish
-    wg.Wait()
+    rewriteCommits(ctx, &wg)
 
 out:
 
