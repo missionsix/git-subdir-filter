@@ -25,12 +25,12 @@ const (
     // queue depth between stages
     STAGE_CHAN_DEPTH = 20
     SOURCE_WORK_BRANCH = "incoming"
-    STAGE_WORK_BRANCH = "staging"
     RUNTIME_CONFIG = "runtime_config"
     RUNTIME_SOURCE_REPO = "runtime_source"
     RUNTIME_TARGET_REPO = "runtime_target"
     RUNTIME_COMMIT_TREE = "commit_tree"
-    RUNTIME_WORKERS = 4
+    FILTER_WORKERS = 1
+    REWRITE_WORKERS = 16
 )
 
 
@@ -88,7 +88,8 @@ func makeCommit(repo *git.Repository, c *git.Commit, t *git.Tree, p *git.Commit)
     return rewrite, err
 }
 
-func rewriteCommits(ctx context.Context, wg *sync.WaitGroup) {
+func rewriteCommits(ctx context.Context, wg *sync.WaitGroup) error {
+    var err error
     var parent *git.Commit
     var count int = 0
 
@@ -97,13 +98,14 @@ func rewriteCommits(ctx context.Context, wg *sync.WaitGroup) {
 
     // Block for synchrous cleanup
     wg.Wait()
+    return nil
 
     fmt.Println("Rewriting commits...")
 
     for e := commits.List.Front(); e != nil; e = e.Next() {
         select {
         case <-ctx.Done():
-            return
+            return nil
         default:
             break
         }
@@ -115,7 +117,7 @@ func rewriteCommits(ctx context.Context, wg *sync.WaitGroup) {
 
         rewrite, err := makeCommit(repo, ci.Commit, ci.RewriteTree, parent)
         if err != nil {
-            panic(err)
+            return err
         }
         parent = rewrite
         fmt.Println(count, rewrite.Id())
@@ -128,18 +130,87 @@ func rewriteCommits(ctx context.Context, wg *sync.WaitGroup) {
             fmt.Println("Could not create branch from commit", parent.Id())
         }
     }
+
+    return err
 }
 
-func rewriteCommit(ctx context.Context, ci *commitItem) {
-    // recursively build TreeBuilder
-    /*
-     tb, err := TreeBuilder()
+// TreeWalk recursively rewrites subtrees
+func TreeWalk(repo *git.Repository, t *git.Tree, parent *git.TreeBuilder) (error) {
+    var err error
+    var oid *git.Oid
+    var te *git.TreeEntry
+    var idx uint64
 
-    tree.Walk(func(entry string, t *git.TreeEntry) {
-       tb.Insert()
-    })
-     */
-    fmt.Println(ci.Commit.Id())
+    for idx = 0; idx < t.EntryCount(); idx++ {
+
+        te = t.EntryByIndex(idx)
+
+        switch te.Type {
+        case git.ObjectTree:
+
+            child, err := repo.TreeBuilder()
+            if err != nil {
+                return err
+            }
+            defer child.Free()
+
+            subtree, err := repo.LookupTree(te.Id)
+            if err != nil {
+                return err
+            }
+
+            err = TreeWalk(repo, subtree, child)
+            if err != nil {
+                return err
+            }
+
+            oid, err = child.Write()
+            if err != nil {
+                return err
+            }
+
+        case git.ObjectBlob:
+            oid = te.Id
+            // XXX: moving objects files to stage repo requires re-writing
+            // them using git.Odb
+        }
+
+        err = parent.Insert(te.Name, oid, te.Filemode)
+        if err != nil {
+            return err
+        }
+    }
+
+    return nil
+}
+
+func rewriteTree(ctx context.Context, ci *commitItem) error {
+    var oid *git.Oid
+
+    repo := ctx.Value(RUNTIME_SOURCE_REPO).(*git.Repository)
+    tree := ci.FilterTree
+
+    tb, err := repo.TreeBuilder()
+    if err != nil {
+        return err
+    }
+    defer tb.Free()
+
+    err = TreeWalk(repo, tree, tb)
+    if err != nil {
+        return err
+    }
+
+    oid, err = tb.Write()
+    if err != nil {
+        return err
+    }
+
+    // Assign for next stage
+    rewriteTree, err := repo.LookupTree(oid)
+    ci.RewriteTree = rewriteTree
+
+    return nil
 }
 
 // rewriteWorker performs the heavy lifting of rewriting the commit tree
@@ -155,7 +226,11 @@ func rewriteWorker(ctx context.Context, wg *sync.WaitGroup, work <-chan *commitI
             if !ok {
                 return
             }
-            rewriteCommit(ctx, ci)
+            fmt.Println("Rewriting tree", ci.Commit.Id())
+            err := rewriteTree(ctx, ci)
+            if err != nil {
+                return
+            }
         }
     }
 }
@@ -570,23 +645,23 @@ func main() {
     rewriteChan = make(chan *commitItem, 1000)
 
     // Strip out the uninteresting commits
-    fmt.Printf("Starting %d filter workers...\n", RUNTIME_WORKERS)
+    fmt.Printf("Starting %d filter workers...\n", FILTER_WORKERS)
 
-    wg.Add(RUNTIME_WORKERS)
-    for i := 0; i < RUNTIME_WORKERS; i++ {
+    wg.Add(FILTER_WORKERS)
+    for i := 0; i < FILTER_WORKERS; i++ {
         go filterWorker(ctx, &wg, filterChan, rewriteChan)
     }
 
     ctx = context.WithValue(ctx, RUNTIME_TARGET_REPO, target)
 
-    fmt.Printf("Starting %d rewrite  workers...\n", RUNTIME_WORKERS)
-    wg.Add(RUNTIME_WORKERS)
-    for i := 0; i < RUNTIME_WORKERS; i++ {
+    fmt.Printf("Starting %d rewrite  workers...\n", REWRITE_WORKERS)
+    wg.Add(REWRITE_WORKERS)
+    for i := 0; i < REWRITE_WORKERS; i++ {
         go rewriteWorker(ctx, &wg, rewriteChan)
     }
 
     // wait for all work to finish
-    rewriteCommits(ctx, &wg)
+    err = rewriteCommits(ctx, &wg)
 
 out:
 
