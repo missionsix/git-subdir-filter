@@ -204,7 +204,15 @@ tb, err := repo.TreeBuilder()
 
 // Walk the current tree
 tree.Walk(func (name string, te *git.TreeEntry) int {
-    tb.Insert(filename, oid, filemode)
+    
+    diffOpt, _ := DefaultDiffOptions()
+
+    diff, err := repo.DiffTreeToTree(oldTree, newTree, diffOpt)
+    if err != nil {
+        
+    }
+
+    tb.Insert(name, oid, filemode)
 })
 
 tb.Write()
@@ -215,3 +223,20 @@ tb, err := repo.TreeBuilderFromTree(tree)
 
 
 ```
+
+Build a tree:
+```go
+tree, _ := repo.TreeBuilder()
+
+// Get the object database
+odb, _ := repo.Odb()
+
+blobId, _ := odb.Write([]byte("hello, world"), git.ObjectBlob)
+
+_ = tree.Insert("greeting", blobId, git.FileModeBlobExecutable)
+
+// Write treeentry
+newtree, _ := tree.Write()
+```
+
+How to get tree entries from current tree?
