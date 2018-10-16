@@ -7,8 +7,6 @@ import (
     "errors"
     "flag"
     "fmt"
-    //    "log"
-    //    "net"
     "container/list"
     "github.com/caarlos0/env"
     "gopkg.in/libgit2/git2go.v26"
@@ -29,8 +27,7 @@ const (
     RUNTIME_SOURCE_REPO = "runtime_source"
     RUNTIME_TARGET_REPO = "runtime_target"
     RUNTIME_COMMIT_TREE = "commit_tree"
-    RUNTIME_FINALIZE_WORKERS = "runtime_finalize"
-    FILTER_WORKERS = 4
+    FILTER_WORKERS = 24
     REWRITE_WORKERS = 24
 )
 
@@ -38,8 +35,6 @@ const (
 type Config struct {
     WorkDir         string `env:"FILTER_DIR" envDefault:"${PWD}/work" envExpand:"true"`
     SourceDir       string `envDefault:"source"`
-    StageDir        string `envDefault:"stage"`
-    TargetDir       string `envDefault:"target"`
     SourceRepo      string `env:"SOURCE_REPO"`
     SourceBranch    string `env:"SOURCE_BRANCH"`
     TargetRepo      string `env:"SOURCE_REPO"`
@@ -49,7 +44,6 @@ type Config struct {
 
 type commitTree struct {
     List *list.List
-//  Cond *sync.Cond
     Mtx sync.Mutex
 }
 
@@ -66,6 +60,11 @@ type commitItem struct {
     RewriteTree *git.Tree
     // Rewrite Commit
     Rewrite *git.Commit
+}
+
+type delAddEntry struct {
+    Deleted bool
+    Added bool
 }
 
 func makeCommit(repo *git.Repository, c *git.Commit, t *git.Tree, p *git.Commit) (*git.Commit, error) {
@@ -92,17 +91,13 @@ func makeCommit(repo *git.Repository, c *git.Commit, t *git.Tree, p *git.Commit)
     return rewrite, err
 }
 
-func rewriteCommits(ctx context.Context, wg *sync.WaitGroup) error {
+func rewriteCommits(ctx context.Context) error {
     var err error
     var parent *git.Commit
     var count int = 0
 
-    repo := ctx.Value(RUNTIME_TARGET_REPO).(*git.Repository)
+    repo := ctx.Value(RUNTIME_SOURCE_REPO).(*git.Repository)
     commits := ctx.Value(RUNTIME_COMMIT_TREE).(*commitTree)
-
-    // Block for synchrous cleanup
-    wg.Wait()
-    return nil
 
     fmt.Println("Rewriting commits...")
 
@@ -115,7 +110,7 @@ func rewriteCommits(ctx context.Context, wg *sync.WaitGroup) error {
         }
 
         ci := e.Value.(*commitItem)
-        if ci.Commit == nil {
+        if ci.RewriteTree == nil {
             continue
         }
 
@@ -218,7 +213,7 @@ func rewriteTree(ctx context.Context, ci *commitItem) error {
 }
 
 // rewriteWorker performs the heavy lifting of rewriting the commit tree
-func rewriteWorker(ctx context.Context, wg *sync.WaitGroup, work <-chan *commitItem) {
+func treeWorker(ctx context.Context, wg *sync.WaitGroup, work <-chan *commitItem) {
 
     defer wg.Done()
 
@@ -230,23 +225,42 @@ func rewriteWorker(ctx context.Context, wg *sync.WaitGroup, work <-chan *commitI
             if !ok {
                 return
             }
-            fmt.Printf("%d Rewriting tree %s\n", ci.Entry, ci.Commit.Id())
             err := rewriteTree(ctx, ci)
             if err != nil {
                 return
             }
+            fmt.Printf("%d Rewrote tree %s\n", ci.Entry, ci.FilterTree.Id())
         }
     }
 }
 
-func readTree(repo *git.Repository, tree *git.Tree, filter []string, n int) (*git.Tree, bool) {
-    var err error
+//
+func rewriteWorkers(ctx context.Context, wg *sync.WaitGroup, commits <-chan *commitItem) {
+    var treeGroup sync.WaitGroup
 
-    if len(filter) == n {
-        return tree, true
+    fmt.Printf("Starting %d tree workers...\n", REWRITE_WORKERS)
+    treeGroup.Add(REWRITE_WORKERS)
+    for i := 0; i < REWRITE_WORKERS; i++ {
+        go treeWorker(ctx, &treeGroup, commits)
     }
 
-    te := tree.EntryByName(filter[n])
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        treeGroup.Wait()
+        // wait for all work to finish
+        err := rewriteCommits(ctx)
+        if err != nil {
+            panic(err)
+        }
+    }()
+}
+
+
+func readTree(repo *git.Repository, tree *git.Tree, filter []string) (*git.Tree, bool) {
+    var err error
+
+    te := tree.EntryByName(filter[0])
     if te == nil {
         return nil, false
     }
@@ -260,7 +274,11 @@ func readTree(repo *git.Repository, tree *git.Tree, filter []string, n int) (*gi
         return nil, false
     }
 
-    return readTree(repo, tree, filter, n+1)
+    if len(filter) == 1 {
+        return tree, true
+    }
+
+    return readTree(repo, tree, filter[1:])
 }
 
 type StopIteration struct {
@@ -276,30 +294,26 @@ func filterWorker(ctx context.Context, wg *sync.WaitGroup,
     var tree *git.Tree
 
     defer wg.Done()
-    defer close(commitChan)
 
     cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
     repo := ctx.Value(RUNTIME_SOURCE_REPO).(*git.Repository)
-    finalize := ctx.Value(RUNTIME_FINALIZE_WORKERS).(*sync.Once)
 
-    filterDirs := strings.Split(cfg.FilterDirectory, "/")
-
+    loop:
     for {
         select {
         case <- ctx.Done():
             return
         case ci, ok := <-filterChan:
             if !ok {
-                // Only one read channel observer will close the write
-                // channel
-                finalize.Do(func () {
-                    close(commitChan)
-                })
+                // done working
                 return
             }
+
+            ci.FilterTree = nil
+
             tree, err = ci.Commit.Tree()
             if err != nil {
-                continue
+                continue loop
             }
 
             diffOptions := &git.DiffOptions {
@@ -310,46 +324,83 @@ func filterWorker(ctx context.Context, wg *sync.WaitGroup,
                 NotifyCallback: nil,
             }
 
-            // Grab the parent tree for comparison
-            var parentTree *git.Tree = nil
-            pe := ci.ListEntry.Prev()
-            if pe != nil {
-                parent := pe.Value.(*commitItem)
-                if parent.Commit != nil {
-                    parentTree, _ = parent.Commit.Tree()
-                }
+            // filter away merge commits
+            if ci.Commit.ParentCount() > 1 {
+                ci.FilterTree = nil
+                continue loop
             }
 
-            // Get child diff
+            // Grab the only parent tree if it exists
+            var parentTree *git.Tree = nil
+            if ci.Commit.ParentCount() == 1 {
+                parentTree, _ = ci.Commit.Parent(0).Tree()
+            }
+
+            // diff parent and child
             diff, err := repo.DiffTreeToTree(parentTree, tree, diffOptions)
             if err != nil {
-                return
+                panic(err)
             }
 
-            include := false
+            // Store deletes & adds for no-op filtering
+            var delAddMap map[string] *delAddEntry
+            delAddMap = make(map[string]*delAddEntry)
+            mapLookup := func(m *map[string]*delAddEntry, key string) *delAddEntry {
+                e, ok := (*m)[key]
+                if !ok {
+                    e = &delAddEntry {
+                        Deleted: false,
+                        Added: false,
+                    }
+                }
+                return e
+            }
 
+            // Process diff looking for usable diff entry
             diffFileCb := func(d git.DiffDelta, p float64) (git.DiffForEachHunkCallback, error) {
+                var mapEntry *delAddEntry = nil
+                switch d.Status {
+                case git.DeltaUnmodified:
+                    // ignore unmodified entries
+                    return nil, nil
+                case git.DeltaDeleted:
+                    mapEntry = mapLookup(&delAddMap, d.NewFile.Path)
+                    mapEntry.Deleted = true
+                    delAddMap[d.NewFile.Path] = mapEntry
+                case git.DeltaAdded:
+                    mapEntry = mapLookup(&delAddMap, d.NewFile.Path)
+                    mapEntry.Added = true
+                    delAddMap[d.NewFile.Path] = mapEntry
+                }
+                // Must keep processsing diff for matching entries
+                if mapEntry != nil {
+                    return nil, nil
+                }
                 return nil, &StopIteration{}
             }
 
             // Iterate diff files
             err = diff.ForEach(diffFileCb, git.DiffDetailFiles)
-            if err == nil {
-                include = true
+            nonDeleteAdd := false
+            for _, e := range delAddMap {
+                if e.Added != e.Deleted {
+                    nonDeleteAdd = true
+                    break
+                }
             }
 
-            if !include {
-                // remove from contention
-                ci.FilterTree = nil
-                continue
+            if err == nil && !nonDeleteAdd {
+                // remove from consideration
+                continue loop
             }
+            err = nil
 
             // if commit tree fails to match, drop it
-            subtree, ok := readTree(repo, tree, filterDirs, 0)
+            filterDirs := strings.Split(cfg.FilterDirectory, "/")
+            subtree, ok := readTree(repo, tree, filterDirs)
             if !ok {
                 // remove element contents to be garbage collected
-                ci.FilterTree = nil
-                continue
+                continue loop
             }
 
             ci.FilterTree = subtree
@@ -360,6 +411,27 @@ func filterWorker(ctx context.Context, wg *sync.WaitGroup,
     }
 }
 
+func filterWorkers(ctx context.Context, wg *sync.WaitGroup,
+    filterChan <-chan *commitItem, commitChan chan<- *commitItem) {
+    var filterGroup sync.WaitGroup
+
+    // Strip out the uninteresting commits
+    fmt.Printf("Starting %d filter workers...\n", FILTER_WORKERS)
+
+    filterGroup.Add(FILTER_WORKERS)
+    for i := 0; i < FILTER_WORKERS; i++ {
+        go filterWorker(ctx, &filterGroup, filterChan, commitChan)
+    }
+
+    // deferred close of filterChan
+    wg.Add(1)
+    go func() {
+        defer wg.Done()
+        filterGroup.Wait()
+        close(commitChan)
+    }()
+}
+
 func stageRevisions(ctx context.Context, wg *sync.WaitGroup,
     inputChan <-chan *git.Commit, filterChan chan<- *commitItem) {
 
@@ -367,13 +439,10 @@ func stageRevisions(ctx context.Context, wg *sync.WaitGroup,
 
     wg.Add(1)
     go func() {
+        var idx int = 0
+
         defer wg.Done()
         defer close(filterChan)
-
-        // Take lock for condition broadcast
-        //commits.Mtx.Lock()
-
-        var idx int = 0
 
         input:
         for {
@@ -517,8 +586,7 @@ out:
     return err
 }
 
-// openRepository will create (if it doesn't exist) and open the 
-// source repository.
+// openRepository will create (if it doesn't exist) a git repository.
 func openRepository(ctx context.Context, name string) (*git.Repository, error) {
     var err error
     var repo *git.Repository
@@ -532,7 +600,6 @@ func openRepository(ctx context.Context, name string) (*git.Repository, error) {
     // Create the source dir, bare
     repo, err = git.InitRepository(path, true)
     if err != nil {
-        //repo, err = git.PlainOpen(path)
         fmt.Fprintf(os.Stderr, "%s\n", err)
         os.Exit(1)
     }
@@ -543,14 +610,12 @@ func openRepository(ctx context.Context, name string) (*git.Repository, error) {
 // buildEnvironment creates the set of working directories
 func buildWorkEnvironment(cfg *Config) error {
     var err error
-    var dirs [4]string
+    var dirs [2]string
 
     dirs[0] = cfg.WorkDir
     dirs[1] = filepath.Join(cfg.WorkDir, cfg.SourceDir)
-    dirs[2] = filepath.Join(cfg.WorkDir, cfg.TargetDir)
-    dirs[3] = filepath.Join(cfg.WorkDir, cfg.StageDir)
 
-    for i := 0; i < 4; i++ {
+    for i := 0; i < 2; i++ {
         err = os.MkdirAll(dirs[i], os.ModePerm)
         if err != nil {
             return err
@@ -601,8 +666,6 @@ func setupEnvironment(cfg *Config) error {
     fmt.Println("Target Repository: ", cfg.TargetRepo)
     fmt.Println("Target Branch: ", cfg.TargetBranch)
     fmt.Println("Source Tree: ", cfg.SourceDir)
-    fmt.Println("Target Tree: ", cfg.TargetDir)
-    fmt.Println("Stage Tree: ", cfg.StageDir)
 
     return nil
 }
@@ -643,13 +706,11 @@ func main() {
     var ret int
     var err error
     var wg sync.WaitGroup
-    var inputChan chan *git.Commitq
+    var inputChan chan *git.Commit
     var filterChan chan *commitItem
     var rewriteChan chan *commitItem
     var source *git.Repository
-    var target *git.Repository
     var commits *commitTree
-    var finalize sync.Once
 
     cfg := Config{}
 
@@ -682,13 +743,6 @@ func main() {
         goto out
     }
 
-
-    target, err = openRepository(ctx, cfg.StageDir)
-    if err != nil {
-        goto out
-    }
-
-
     // Create work structures
     commits = &commitTree {
         List: list.New(),
@@ -705,31 +759,18 @@ func main() {
 
     filterChan = make(chan *commitItem, FILTER_WORKERS)
 
-    // Start workers
+    // Start revision sequencer
     stageRevisions(ctx, &wg, inputChan, filterChan)
 
     rewriteChan = make(chan *commitItem, REWRITE_WORKERS)
 
-    // Strip out the uninteresting commits
-    fmt.Printf("Starting %d filter workers...\n", FILTER_WORKERS)
+    // Start revision filters
+    filterWorkers(ctx, &wg, filterChan, rewriteChan)
 
-    ctx = context.WithValue(ctx, RUNTIME_FINALIZE_WORKERS, &finalize)
+    // Launch commit and tree rewriters
+    rewriteWorkers(ctx, &wg, rewriteChan)
 
-    wg.Add(FILTER_WORKERS)
-    for i := 0; i < FILTER_WORKERS; i++ {
-        go filterWorker(ctx, &wg, filterChan, rewriteChan)
-    }
-
-    ctx = context.WithValue(ctx, RUNTIME_TARGET_REPO, target)
-
-    fmt.Printf("Starting %d rewrite  workers...\n", REWRITE_WORKERS)
-    wg.Add(REWRITE_WORKERS)
-    for i := 0; i < REWRITE_WORKERS; i++ {
-        go rewriteWorker(ctx, &wg, rewriteChan)
-    }
-
-    // wait for all work to finish
-    err = rewriteCommits(ctx, &wg)
+    wg.Wait()
 
 out:
 
