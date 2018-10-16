@@ -29,8 +29,9 @@ const (
     RUNTIME_SOURCE_REPO = "runtime_source"
     RUNTIME_TARGET_REPO = "runtime_target"
     RUNTIME_COMMIT_TREE = "commit_tree"
-    FILTER_WORKERS = 1
-    REWRITE_WORKERS = 16
+    RUNTIME_FINALIZE_WORKERS = "runtime_finalize"
+    FILTER_WORKERS = 4
+    REWRITE_WORKERS = 24
 )
 
 
@@ -53,9 +54,12 @@ type commitTree struct {
 }
 
 type commitItem struct {
-    ListElement *list.Element
+    // entry in commitTree
+    ListEntry *list.Element
     // Source commit
     Commit *git.Commit
+    // Index
+    Entry int
     // Filtered subtree
     FilterTree *git.Tree
     // Rewritten tree object
@@ -226,7 +230,7 @@ func rewriteWorker(ctx context.Context, wg *sync.WaitGroup, work <-chan *commitI
             if !ok {
                 return
             }
-            fmt.Println("Rewriting tree", ci.Commit.Id())
+            fmt.Printf("%d Rewriting tree %s\n", ci.Entry, ci.Commit.Id())
             err := rewriteTree(ctx, ci)
             if err != nil {
                 return
@@ -259,15 +263,24 @@ func readTree(repo *git.Repository, tree *git.Tree, filter []string, n int) (*gi
     return readTree(repo, tree, filter, n+1)
 }
 
+type StopIteration struct {
+}
+func (e *StopIteration) Error() string {
+    return fmt.Sprintf("Iteration stopped")
+}
+
+
 func filterWorker(ctx context.Context, wg *sync.WaitGroup,
     filterChan <-chan *commitItem, commitChan chan<- *commitItem) {
     var err error
     var tree *git.Tree
 
     defer wg.Done()
+    defer close(commitChan)
 
     cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
     repo := ctx.Value(RUNTIME_SOURCE_REPO).(*git.Repository)
+    finalize := ctx.Value(RUNTIME_FINALIZE_WORKERS).(*sync.Once)
 
     filterDirs := strings.Split(cfg.FilterDirectory, "/")
 
@@ -277,32 +290,74 @@ func filterWorker(ctx context.Context, wg *sync.WaitGroup,
             return
         case ci, ok := <-filterChan:
             if !ok {
+                // Only one read channel observer will close the write
+                // channel
+                finalize.Do(func () {
+                    close(commitChan)
+                })
                 return
             }
             tree, err = ci.Commit.Tree()
             if err != nil {
                 continue
             }
-            // if commit tree fails to match, drop it
-            tree, ok := readTree(repo, tree, filterDirs, 0)
-            if !ok {
-                // remove element contents to be garbage collected
-                ci.Commit = nil
+
+            diffOptions := &git.DiffOptions {
+                Flags: git.DiffNormal,
+                IgnoreSubmodules: git.SubmoduleIgnoreAll,
+                Pathspec: []string{cfg.FilterDirectory},
+                MaxSize: -1,
+                NotifyCallback: nil,
+            }
+
+            // Grab the parent tree for comparison
+            var parentTree *git.Tree = nil
+            pe := ci.ListEntry.Prev()
+            if pe != nil {
+                parent := pe.Value.(*commitItem)
+                if parent.Commit != nil {
+                    parentTree, _ = parent.Commit.Tree()
+                }
+            }
+
+            // Get child diff
+            diff, err := repo.DiffTreeToTree(parentTree, tree, diffOptions)
+            if err != nil {
+                return
+            }
+
+            include := false
+
+            diffFileCb := func(d git.DiffDelta, p float64) (git.DiffForEachHunkCallback, error) {
+                return nil, &StopIteration{}
+            }
+
+            // Iterate diff files
+            err = diff.ForEach(diffFileCb, git.DiffDetailFiles)
+            if err == nil {
+                include = true
+            }
+
+            if !include {
+                // remove from contention
                 ci.FilterTree = nil
                 continue
             }
 
-            ci.FilterTree = tree
-            // non-blocking send the commit item to next worker
-            select {
-            case commitChan <- ci:
+            // if commit tree fails to match, drop it
+            subtree, ok := readTree(repo, tree, filterDirs, 0)
+            if !ok {
+                // remove element contents to be garbage collected
+                ci.FilterTree = nil
+                continue
             }
+
+            ci.FilterTree = subtree
+
+            // blocking send the commit item to next worker
+            commitChan <- ci
         }
     }
-}
-
-func filterRevisions(ctx context.Context, wg *sync.WaitGroup,
-    filterChan <-chan *commitItem, commitChan chan<- *commitItem) {
 }
 
 func stageRevisions(ctx context.Context, wg *sync.WaitGroup,
@@ -318,6 +373,8 @@ func stageRevisions(ctx context.Context, wg *sync.WaitGroup,
         // Take lock for condition broadcast
         //commits.Mtx.Lock()
 
+        var idx int = 0
+
         input:
         for {
             select {
@@ -328,12 +385,14 @@ func stageRevisions(ctx context.Context, wg *sync.WaitGroup,
                     break input
                 }
                 ci := &commitItem{
+                    Entry: idx,
                     Commit: c,
                 }
+                idx += 1
 
                 // returns list-element (container)
                 e := commits.List.PushFront(ci)
-                ci.ListElement = e
+                ci.ListEntry = e
             }
         }
 
@@ -342,6 +401,12 @@ func stageRevisions(ctx context.Context, wg *sync.WaitGroup,
 
         // Send ordered commits to be filtered
         for e := commits.List.Front(); e != nil; e = e.Next() {
+            select {
+            case <-ctx.Done():
+                return
+            default:
+                break
+            }
             ci := e.Value.(*commitItem)
             filterChan <- ci
         }
@@ -383,8 +448,8 @@ func readInputRevisions(ctx context.Context, wg *sync.WaitGroup,
             case <-ctx.Done():
                 return false
             case inputChan <- c:
+                return true
             }
-            return true
         })
         fmt.Println("Reading inputs finished.")
     }()
@@ -578,12 +643,13 @@ func main() {
     var ret int
     var err error
     var wg sync.WaitGroup
-    var inputChan chan *git.Commit
+    var inputChan chan *git.Commitq
     var filterChan chan *commitItem
     var rewriteChan chan *commitItem
     var source *git.Repository
     var target *git.Repository
     var commits *commitTree
+    var finalize sync.Once
 
     cfg := Config{}
 
@@ -637,15 +703,17 @@ func main() {
     // Launch sequency input processing
     readInputRevisions(ctx, &wg, inputChan)
 
-    filterChan = make(chan *commitItem, 1000)
+    filterChan = make(chan *commitItem, FILTER_WORKERS)
 
     // Start workers
     stageRevisions(ctx, &wg, inputChan, filterChan)
 
-    rewriteChan = make(chan *commitItem, 1000)
+    rewriteChan = make(chan *commitItem, REWRITE_WORKERS)
 
     // Strip out the uninteresting commits
     fmt.Printf("Starting %d filter workers...\n", FILTER_WORKERS)
+
+    ctx = context.WithValue(ctx, RUNTIME_FINALIZE_WORKERS, &finalize)
 
     wg.Add(FILTER_WORKERS)
     for i := 0; i < FILTER_WORKERS; i++ {
