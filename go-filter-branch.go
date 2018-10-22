@@ -12,7 +12,6 @@ import (
     "gopkg.in/libgit2/git2go.v26"
     "os"
     "os/signal"
-    "path/filepath"
     "sync"
     "strings"
     "syscall"
@@ -34,7 +33,6 @@ const (
 
 type Config struct {
     WorkDir         string `env:"FILTER_DIR" envDefault:"${PWD}/work" envExpand:"true"`
-    SourceDir       string `envDefault:"source"`
     SourceRepo      string `env:"SOURCE_REPO"`
     SourceBranch    string `env:"SOURCE_BRANCH"`
     TargetRepo      string `env:"SOURCE_REPO"`
@@ -94,7 +92,6 @@ func makeCommit(repo *git.Repository, c *git.Commit, t *git.Tree, p *git.Commit)
 func rewriteCommits(ctx context.Context) error {
     var err error
     var parent *git.Commit
-    var count int = 0
 
     repo := ctx.Value(RUNTIME_SOURCE_REPO).(*git.Repository)
     commits := ctx.Value(RUNTIME_COMMIT_TREE).(*commitTree)
@@ -119,8 +116,7 @@ func rewriteCommits(ctx context.Context) error {
             return err
         }
         parent = rewrite
-        fmt.Println(count, rewrite.Id())
-        count += 1
+        fmt.Println("New commit ", rewrite.Id())
     }
 
     if parent != nil {
@@ -587,14 +583,11 @@ out:
 }
 
 // openRepository will create (if it doesn't exist) a git repository.
-func openRepository(ctx context.Context, name string) (*git.Repository, error) {
+func openRepository(path string) (*git.Repository, error) {
     var err error
     var repo *git.Repository
 
-    cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
-
     // open the source dir
-    path := filepath.Join(cfg.WorkDir, name)
     fmt.Println("Opening repo: ", path)
 
     // Create the source dir, bare
@@ -610,16 +603,10 @@ func openRepository(ctx context.Context, name string) (*git.Repository, error) {
 // buildEnvironment creates the set of working directories
 func buildWorkEnvironment(cfg *Config) error {
     var err error
-    var dirs [2]string
 
-    dirs[0] = cfg.WorkDir
-    dirs[1] = filepath.Join(cfg.WorkDir, cfg.SourceDir)
-
-    for i := 0; i < 2; i++ {
-        err = os.MkdirAll(dirs[i], os.ModePerm)
-        if err != nil {
-            return err
-        }
+    err = os.MkdirAll(cfg.WorkDir, os.ModePerm)
+    if err != nil {
+        return err
     }
 
     return nil
@@ -665,7 +652,6 @@ func setupEnvironment(cfg *Config) error {
     fmt.Println("Source Branch: ", cfg.SourceBranch)
     fmt.Println("Target Repository: ", cfg.TargetRepo)
     fmt.Println("Target Branch: ", cfg.TargetBranch)
-    fmt.Println("Source Tree: ", cfg.SourceDir)
 
     return nil
 }
@@ -732,7 +718,7 @@ func main() {
     ctx = context.WithValue(ctx, RUNTIME_CONFIG, &cfg)
 
     // Clone and sync source repo
-    source, err = openRepository(ctx, cfg.SourceDir)
+    source, err = openRepository(cfg.WorkDir)
     if err != nil {
         goto out
     }
