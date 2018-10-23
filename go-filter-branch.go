@@ -28,6 +28,8 @@ const (
     RUNTIME_COMMIT_TREE = "commit_tree"
     FILTER_WORKERS = 24
     REWRITE_WORKERS = 24
+    RESUME_TAG = "resume_filter_tag"
+    RESUME_COMMIT = "resume_commit"
 )
 
 
@@ -92,9 +94,17 @@ func makeCommit(repo *git.Repository, c *git.Commit, t *git.Tree, p *git.Commit)
 func rewriteCommits(ctx context.Context) error {
     var err error
     var parent *git.Commit
+    var rewrite *git.Commit
 
     repo := ctx.Value(RUNTIME_SOURCE_REPO).(*git.Repository)
     commits := ctx.Value(RUNTIME_COMMIT_TREE).(*commitTree)
+
+    // Lookup the resume tag commit to use as the parent
+    tagspec := fmt.Sprintf("refs/tags/%s", RESUME_TAG)
+    resumeObj, _ := repo.RevparseSingle(tagspec)
+    if resumeObj != nil {
+        parent, _ = repo.LookupCommit(resumeObj.Id())
+    }
 
     fmt.Println("Rewriting commits...")
 
@@ -111,19 +121,35 @@ func rewriteCommits(ctx context.Context) error {
             continue
         }
 
-        rewrite, err := makeCommit(repo, ci.Commit, ci.RewriteTree, parent)
+        rewrite, err = makeCommit(repo, ci.Commit, ci.RewriteTree, parent)
         if err != nil {
             return err
         }
         parent = rewrite
-        fmt.Println("New commit ", rewrite.Id())
+        fmt.Println("New Commit", rewrite.Id())
     }
 
-    if parent != nil {
-        _, err := repo.CreateBranch(SOURCE_WORK_BRANCH, parent, true)
+    if rewrite != nil {
+        // Create/move the local branch
+        _, err := repo.CreateBranch(SOURCE_WORK_BRANCH, rewrite, true)
         if err != nil {
-            fmt.Println("Could not create branch from commit", parent.Id())
+            fmt.Println("Could not create branch from commit", rewrite.Id())
         }
+    }
+
+    // Create the resume tag from the last (most recent) filtered commit
+    for e := commits.List.Back(); e != nil; e = e.Prev() {
+
+        ci := e.Value.(*commitItem)
+        if ci.RewriteTree == nil {
+            continue
+        }
+
+        _, err = repo.Tags.CreateLightweight(RESUME_TAG, ci.Commit, true)
+        if err != nil {
+            fmt.Println("Could not create resume tag from commit", parent.Id())
+        }
+        break
     }
 
     return err
@@ -486,12 +512,21 @@ func readInputRevisions(ctx context.Context, wg *sync.WaitGroup,
     wg.Add(1)
     go func() {
         var err error
+        var resumeObjId *git.Oid
 
         defer wg.Done()
         defer close(inputChan)
 
         cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
         source := ctx.Value(RUNTIME_SOURCE_REPO).(*git.Repository)
+
+        // lookup resume tag from previous iteration
+        tagspec := fmt.Sprintf("refs/tags/%s", RESUME_TAG)
+        resumeObj, _ := source.RevparseSingle(tagspec)
+        if resumeObj != nil {
+            resumeObjId = resumeObj.Id()
+            fmt.Println("Found resume tag ", resumeObjId)
+        }
 
         revwalk, err := source.Walk()
         if err != nil {
@@ -502,13 +537,19 @@ func readInputRevisions(ctx context.Context, wg *sync.WaitGroup,
         // Set sort order - Topo reverse choronological
         revwalk.Sorting(git.SortTopological | git.SortTime)
 
-        // Get reference
+        // Lookup source reference and set as start reference for walk
         refname := fmt.Sprintf("refs/remotes/%s/%s", GIT_ORIGIN, cfg.SourceBranch)
         revwalk.PushRef(refname)
 
         // Send commit revisions into input channel
         // in reverse chronological order
         revwalk.Iterate(func (c *git.Commit) bool {
+            // stop on resume commit
+            if resumeObjId != nil && *c.Id() == *resumeObjId {
+                fmt.Println("Stopping on resume commit")
+                return false
+            }
+
             select {
             case <-ctx.Done():
                 return false
