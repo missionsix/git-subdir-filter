@@ -12,6 +12,7 @@ import (
     "gopkg.in/libgit2/git2go.v26"
     "os"
     "os/signal"
+    "runtime"
     "sync"
     "strings"
     "syscall"
@@ -28,8 +29,6 @@ const (
     RUNTIME_SOURCE_REPO = "runtime_source"
     RUNTIME_TARGET_REPO = "runtime_target"
     RUNTIME_COMMIT_TREE = "commit_tree"
-    FILTER_WORKERS = 24
-    REWRITE_WORKERS = 24
     RESUME_TAG = "resume_filter_tag"
     RESUME_COMMIT = "resume_commit"
 )
@@ -42,6 +41,7 @@ type Config struct {
     TargetRepo      string `env:"SOURCE_REPO"`
     TargetBranch    string `env:"TARGET_BRANCH"`
     FilterDirectory string
+    WorkerCount     int
 }
 
 type commitTree struct {
@@ -267,7 +267,7 @@ func treeWorker(ctx context.Context, wg *sync.WaitGroup, work <-chan *commitItem
     }
 }
 
-// rewriteWorkers dispatches REWRITE_WORKERS to rewrite the
+// rewriteWorkers dispatches workers to rewrite the
 // filtered trees. It then synchronously processes commits
 // building the new commit history for the WORK_BRANCH
 // finally, it sends a value to the publish channel
@@ -275,9 +275,11 @@ func rewriteWorkers(ctx context.Context, wg *sync.WaitGroup,
     commits <-chan *commitItem, publish chan<- bool) {
     var treeGroup sync.WaitGroup
 
-    fmt.Printf("Starting %d tree workers...\n", REWRITE_WORKERS)
-    treeGroup.Add(REWRITE_WORKERS)
-    for i := 0; i < REWRITE_WORKERS; i++ {
+    cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
+
+    fmt.Printf("Starting %d tree workers...\n", cfg.WorkerCount)
+    treeGroup.Add(cfg.WorkerCount)
+    for i := 0; i < cfg.WorkerCount; i++ {
         go treeWorker(ctx, &treeGroup, commits)
     }
 
@@ -476,11 +478,12 @@ func filterWorkers(ctx context.Context, wg *sync.WaitGroup,
     filterChan <-chan *commitItem, commitChan chan<- *commitItem) {
     var filterGroup sync.WaitGroup
 
-    // Strip out the uninteresting commits
-    fmt.Printf("Starting %d filter workers...\n", FILTER_WORKERS)
+    cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
 
-    filterGroup.Add(FILTER_WORKERS)
-    for i := 0; i < FILTER_WORKERS; i++ {
+    fmt.Printf("Starting %d filter workers...\n", cfg.WorkerCount)
+
+    filterGroup.Add(cfg.WorkerCount)
+    for i := 0; i < cfg.WorkerCount; i++ {
         go filterWorker(ctx, &filterGroup, filterChan, commitChan)
     }
 
@@ -762,12 +765,14 @@ func buildWorkEnvironment(cfg *Config) error {
 
 // setupEnvironment sets the runtime
 func setupEnvironment(cfg *Config) error {
+    var workers int
 
     sourceRepo := flag.String("source-repo", "", "Source git repository (required)")
     sourceBranch := flag.String("source-branch", "master", "Source git branch (default: master)")
     targetRepo := flag.String("target-repo", "", "Target git repository (required)")
     targetBranch := flag.String("target-branch", "master", "Target git branch (default: master)")
     filterDir := flag.String("filter-dir", "", "Filter Directory (required)")
+    workerCount := flag.Int("workers", 0, "Worker Count")
 
     // Parse environment
     err := env.Parse(cfg)
@@ -789,17 +794,24 @@ func setupEnvironment(cfg *Config) error {
         return errors.New("-filter-dir is required")
     }
 
+    if *workerCount == 0 {
+        workers = runtime.NumCPU()
+        workerCount = &workers
+    }
+
     cfg.SourceRepo = *sourceRepo
     cfg.TargetRepo = *targetRepo
     cfg.SourceBranch = *sourceBranch
     cfg.TargetBranch = *targetBranch
     cfg.FilterDirectory = *filterDir
+    cfg.WorkerCount = *workerCount
 
     fmt.Println("Working Directory: ", cfg.WorkDir)
     fmt.Println("Source Repository: ", cfg.SourceRepo)
     fmt.Println("Source Branch: ", cfg.SourceBranch)
     fmt.Println("Target Repository: ", cfg.TargetRepo)
     fmt.Println("Target Branch: ", cfg.TargetBranch)
+    fmt.Println("Workers: ", cfg.WorkerCount)
 
     return nil
 }
@@ -894,12 +906,12 @@ func main() {
     // Launch sequency input processing
     readInputRevisions(ctx, &wg, inputChan)
 
-    filterChan = make(chan *commitItem, FILTER_WORKERS)
+    filterChan = make(chan *commitItem, cfg.WorkerCount)
 
     // Start revision sequencer
     stageRevisions(ctx, &wg, inputChan, filterChan)
 
-    rewriteChan = make(chan *commitItem, REWRITE_WORKERS)
+    rewriteChan = make(chan *commitItem, cfg.WorkerCount)
 
     // Start revision filters
     filterWorkers(ctx, &wg, filterChan, rewriteChan)
