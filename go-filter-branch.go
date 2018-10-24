@@ -19,6 +19,8 @@ import (
 
 const (
     GIT_ORIGIN = "origin"
+    GIT_REMOTE_TARGET = "target"
+
     // queue depth between stages
     STAGE_CHAN_DEPTH = 20
     SOURCE_WORK_BRANCH = "incoming"
@@ -91,19 +93,26 @@ func makeCommit(repo *git.Repository, c *git.Commit, t *git.Tree, p *git.Commit)
     return rewrite, err
 }
 
-func rewriteCommits(ctx context.Context) error {
+func rewriteCommits(ctx context.Context) (uint, error) {
     var err error
     var parent *git.Commit
     var rewrite *git.Commit
+    var count uint = 0
 
     repo := ctx.Value(RUNTIME_SOURCE_REPO).(*git.Repository)
     commits := ctx.Value(RUNTIME_COMMIT_TREE).(*commitTree)
 
-    // Lookup the resume tag commit to use as the parent
+    // Lookup the head of SOURCE_WORK_BREANCH to use as the parent
     tagspec := fmt.Sprintf("refs/tags/%s", RESUME_TAG)
     resumeObj, _ := repo.RevparseSingle(tagspec)
     if resumeObj != nil {
-        parent, _ = repo.LookupCommit(resumeObj.Id())
+        refspec := fmt.Sprintf("refs/heads/%s", SOURCE_WORK_BRANCH)
+        lastCommit, err := repo.RevparseSingle(refspec)
+        if err != nil {
+            return count, err
+        }
+
+        parent, _ = repo.LookupCommit(lastCommit.Id())
     }
 
     fmt.Println("Rewriting commits...")
@@ -111,7 +120,7 @@ func rewriteCommits(ctx context.Context) error {
     for e := commits.List.Front(); e != nil; e = e.Next() {
         select {
         case <-ctx.Done():
-            return nil
+            return count, nil
         default:
             break
         }
@@ -123,9 +132,10 @@ func rewriteCommits(ctx context.Context) error {
 
         rewrite, err = makeCommit(repo, ci.Commit, ci.RewriteTree, parent)
         if err != nil {
-            return err
+            return 0, err
         }
         parent = rewrite
+        count += 1
         fmt.Println("New Commit", rewrite.Id())
     }
 
@@ -134,6 +144,7 @@ func rewriteCommits(ctx context.Context) error {
         _, err := repo.CreateBranch(SOURCE_WORK_BRANCH, rewrite, true)
         if err != nil {
             fmt.Println("Could not create branch from commit", rewrite.Id())
+            return 0, err
         }
     }
 
@@ -152,7 +163,7 @@ func rewriteCommits(ctx context.Context) error {
         break
     }
 
-    return err
+    return count, err
 }
 
 // TreeWalk recursively rewrites subtrees
@@ -256,8 +267,12 @@ func treeWorker(ctx context.Context, wg *sync.WaitGroup, work <-chan *commitItem
     }
 }
 
-//
-func rewriteWorkers(ctx context.Context, wg *sync.WaitGroup, commits <-chan *commitItem) {
+// rewriteWorkers dispatches REWRITE_WORKERS to rewrite the
+// filtered trees. It then synchronously processes commits
+// building the new commit history for the WORK_BRANCH
+// finally, it sends a value to the publish channel
+func rewriteWorkers(ctx context.Context, wg *sync.WaitGroup,
+    commits <-chan *commitItem, publish chan<- bool) {
     var treeGroup sync.WaitGroup
 
     fmt.Printf("Starting %d tree workers...\n", REWRITE_WORKERS)
@@ -269,11 +284,34 @@ func rewriteWorkers(ctx context.Context, wg *sync.WaitGroup, commits <-chan *com
     wg.Add(1)
     go func() {
         defer wg.Done()
+        defer close(publish)
+
         treeGroup.Wait()
         // wait for all work to finish
-        err := rewriteCommits(ctx)
+        count, err := rewriteCommits(ctx)
         if err != nil {
             panic(err)
+        }
+        sync := false
+        if count > 0 {
+            sync = true
+        }
+
+        publish <- sync
+
+        fmt.Println("Performing memory cleanup...")
+        clist := ctx.Value(RUNTIME_COMMIT_TREE).(*commitTree)
+
+        var next *list.Element
+        for e := clist.List.Front(); e != nil; e = next {
+            next = e.Next()
+            ci := e.Value.(*commitItem)
+            ci.Commit = nil
+            ci.FilterTree = nil
+            ci.RewriteTree = nil
+            ci.Rewrite = nil
+
+            clist.List.Remove(e)
         }
     }()
 }
@@ -305,6 +343,7 @@ func readTree(repo *git.Repository, tree *git.Tree, filter []string) (*git.Tree,
 
 type StopIteration struct {
 }
+
 func (e *StopIteration) Error() string {
     return fmt.Sprintf("Iteration stopped")
 }
@@ -557,15 +596,7 @@ func readInputRevisions(ctx context.Context, wg *sync.WaitGroup,
                 return true
             }
         })
-        fmt.Println("Reading inputs finished.")
     }()
-}
-
-
-// maekRefSpec generates a refspec string from remote and branch names
-func makeRefSpec(remote string, branch string) string {
-    return fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s",
-        branch, remote, branch)
 }
 
 // FIXME
@@ -602,7 +633,8 @@ func fetchRemote(ctx context.Context, repo *git.Repository) error {
         }
     }
 
-    refspec = makeRefSpec(GIT_ORIGIN, cfg.SourceBranch)
+    refspec = fmt.Sprintf("+refs/heads/%s:refs/remotes/%s/%s",
+        cfg.SourceBranch, GIT_ORIGIN, cfg.SourceBranch)
 
     options = git.FetchOptions{
         Prune: git.FetchNoPrune,
@@ -621,6 +653,81 @@ func fetchRemote(ctx context.Context, repo *git.Repository) error {
 
 out:
     return err
+}
+
+
+// pushRemote performs a blocking push to the target repository
+// from the WORK_BRANCH to the TARGET_BRANCH
+func pushRemote(ctx context.Context, repo *git.Repository) error {
+    var err error
+    var refspec string
+    var remote *git.Remote
+    var options git.PushOptions
+
+    cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
+
+    remote, err = repo.Remotes.Lookup(GIT_REMOTE_TARGET)
+    if err != nil {
+        // Remote target does not exist, add it.
+        remote, err = repo.Remotes.Create(GIT_REMOTE_TARGET, cfg.TargetRepo)
+        if err != nil {
+            fmt.Println(err)
+            goto out
+        }
+    }
+
+    // blindly update url
+    repo.Remotes.SetUrl(GIT_REMOTE_TARGET, cfg.TargetRepo)
+
+    refspec = fmt.Sprintf("+refs/heads/%s:refs/heads/%s",
+        SOURCE_WORK_BRANCH, cfg.TargetBranch)
+
+    options = git.PushOptions{
+        RemoteCallbacks: git.RemoteCallbacks {
+            CredentialsCallback: credCheckCallback,
+            CertificateCheckCallback: certCheckCallback,
+        },
+        PbParallelism: 0, // auto-scale pack-builder threads
+    }
+
+    fmt.Println("pushing...")
+    err = remote.Push([]string{refspec}, &options)
+
+out:
+    return err
+}
+
+// remoteWorker waits for a publish signal and then either bails or
+// calls pushRemote to update the target repo
+func remoteWorker(ctx context.Context, wg *sync.WaitGroup, publish <-chan bool) {
+
+    wg.Add(1)
+    go func() {
+        var pub bool
+        defer wg.Done()
+
+    loop:
+        for {
+            select {
+            case <-ctx.Done():
+                return
+            case pub = <-publish:
+                break loop
+            }
+        }
+        if !pub {
+            fmt.Println("No new work to sync to target")
+            return
+        }
+
+        repo := ctx.Value(RUNTIME_SOURCE_REPO).(*git.Repository)
+
+        fmt.Println("Sending updates to target repo")
+        err := pushRemote(ctx, repo)
+        if err != nil {
+            fmt.Println(err)
+        }
+    }()
 }
 
 // openRepository will create (if it doesn't exist) a git repository.
@@ -706,7 +813,7 @@ func usage(err error) {
 
 // Global signal handler, cancels the context
 // return cancel func for graceful teardown
-func SignalHandler(ctx context.Context) context.CancelFunc {
+func SignalHandler(ctx context.Context, cancelled *bool) (context.Context, context.CancelFunc) {
     sigs := make(chan os.Signal, 1)
     signal.Notify(sigs, syscall.SIGINT, syscall.SIGTERM)
 
@@ -718,6 +825,7 @@ func SignalHandler(ctx context.Context) context.CancelFunc {
             case <-c.Done():
                 signal.Stop(sigs)
                 fmt.Println("Exiting signal handler")
+                *cancelled = true
                 return
             case s := <-sigs:
                 fmt.Println("Received Signal: ", s)
@@ -726,7 +834,7 @@ func SignalHandler(ctx context.Context) context.CancelFunc {
         }
     }()
 
-    return cancel
+    return c, cancel
 }
 
 func main() {
@@ -736,8 +844,10 @@ func main() {
     var inputChan chan *git.Commit
     var filterChan chan *commitItem
     var rewriteChan chan *commitItem
+    var doneChan chan bool
     var source *git.Repository
     var commits *commitTree
+    var cancelled bool = false
 
     cfg := Config{}
 
@@ -754,7 +864,7 @@ func main() {
 
     // Setup runtime context
     ctx := context.Background()
-    cancel := SignalHandler(ctx)
+    ctx, cancel := SignalHandler(ctx, &cancelled)
 
     ctx = context.WithValue(ctx, RUNTIME_CONFIG, &cfg)
 
@@ -794,10 +904,19 @@ func main() {
     // Start revision filters
     filterWorkers(ctx, &wg, filterChan, rewriteChan)
 
+    doneChan = make(chan bool, 1)
+
     // Launch commit and tree rewriters
-    rewriteWorkers(ctx, &wg, rewriteChan)
+    rewriteWorkers(ctx, &wg, rewriteChan, doneChan)
+
+    // Remote worker blocks waiting for signal to sync
+    remoteWorker(ctx, &wg, doneChan)
 
     wg.Wait()
+
+    if cancelled {
+        goto out
+    }
 
 out:
 
