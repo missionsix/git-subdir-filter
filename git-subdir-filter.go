@@ -1,4 +1,7 @@
-// Filter Branch
+// Git subdirectory filter
+//
+// Author: Patrick Andrew <pat@missionsix.net>
+// Date: 2018
 
 package main
 
