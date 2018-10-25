@@ -107,12 +107,10 @@ func rewriteCommits(ctx context.Context) (uint, error) {
     resumeObj, _ := repo.RevparseSingle(tagspec)
     if resumeObj != nil {
         refspec := fmt.Sprintf("refs/heads/%s", SOURCE_WORK_BRANCH)
-        lastCommit, err := repo.RevparseSingle(refspec)
-        if err != nil {
-            return count, err
+        lastCommit, _ := repo.RevparseSingle(refspec)
+        if lastCommit != nil {
+            parent, _ = repo.LookupCommit(lastCommit.Id())
         }
-
-        parent, _ = repo.LookupCommit(lastCommit.Id())
     }
 
     fmt.Println("Rewriting commits...")
