@@ -31,7 +31,7 @@ import (
     "fmt"
     "container/list"
     "github.com/caarlos0/env"
-    "gopkg.in/libgit2/git2go.v26"
+    "gopkg.in/libgit2/git2go.v27"
     "os"
     "os/signal"
     "runtime"

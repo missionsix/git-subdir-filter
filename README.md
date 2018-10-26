@@ -21,7 +21,7 @@ Therefore, the goals of this project:
 
 ## Requirements
 
- * [libgit.v26](https://github.com/libgit2/libgit2/releases/tag/v0.26.7)
+ * [libgit.v27](https://github.com/libgit2/libgit2/releases/tag/v0.27.4)
  * `SSH_AGENT` must be set in your environment.
  * Source git repository branch with a subdirectory
  * A target repository (could be local)
