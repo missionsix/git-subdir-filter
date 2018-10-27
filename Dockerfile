@@ -16,10 +16,11 @@ FROM alpine:3.8
 RUN apk update && \
     apk add --no-cache openssh-client libgit2>=0.27
 
-ARG SSH_PRIVATE_KEY
 RUN mkdir /root/.ssh/
-RUN echo "${SSH_PRIVATE_KEY}" > /root/.ssh/id_rsa
+COPY id_rsa.pub /root/.ssh/
+COPY id_rsa /root/.ssh/
 RUN chmod 400 /root/.ssh/id_rsa
+RUN chmod 400 /root/.ssh/id_rsa.pub
 
 RUN eval $(ssh-agent -s)
 
@@ -35,6 +36,7 @@ ARG SOURCE_BRANCH
 ARG SOURCE_REPO
 ARG TARGET_REPO
 ARG FILTER_DIR
+ARG WORKDIR
 
 WORKDIR /git
 
