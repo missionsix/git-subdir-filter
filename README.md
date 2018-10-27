@@ -22,9 +22,10 @@ Therefore, the goals of this project:
 ## Requirements
 
  * [libgit.v27](https://github.com/libgit2/libgit2/releases/tag/v0.27.4)
- * `SSH_AGENT` must be set in your environment.
  * Source git repository branch with a subdirectory
  * A target repository (could be local)
+ * `rsa` keys must be in the standard `$USER/.ssh/` location
+ * `SSH_PASSKEY` must be set if your private key needs unlocking
 
 #### Notice
 
