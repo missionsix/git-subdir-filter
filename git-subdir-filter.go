@@ -57,12 +57,12 @@ const (
 
 
 type Config struct {
-    WorkDir         string `env:"FILTER_DIR" envDefault:"${PWD}/work" envExpand:"true"`
+    WorkDir         string `env:"WORKDIR" envDefault:"${PWD}/work" envExpand:"true"`
     SourceRepo      string `env:"SOURCE_REPO"`
     SourceBranch    string `env:"SOURCE_BRANCH"`
     TargetRepo      string `env:"SOURCE_REPO"`
     TargetBranch    string `env:"TARGET_BRANCH"`
-    FilterDirectory string
+    FilterDirectory string `env:"FILTER_DIR"`
     WorkerCount     int
 }
 
