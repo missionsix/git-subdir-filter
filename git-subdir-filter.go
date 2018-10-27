@@ -622,9 +622,18 @@ func readInputRevisions(ctx context.Context, wg *sync.WaitGroup,
     }()
 }
 
-// FIXME
+// credCheckCallback uses the runtime users ssh rsa keys to talk to the target repo
 func credCheckCallback(url string, user string, allowedTypes git.CredType) (git.ErrorCode, *git.Cred) {
-    ret, cred := git.NewCredSshKeyFromAgent(user)
+    home := os.Getenv("HOME")
+    pass := os.Getenv("SSH_PASSKEY")
+    pub := fmt.Sprintf("%s/.ssh/id_rsa.pub", home)
+    priv := fmt.Sprintf("%s/.ssh/id_rsa", home)
+
+    fmt.Println("Public key:", pub)
+    fmt.Println("Private key:", priv)
+
+    ret, cred := git.NewCredSshKey(user, pub, priv, pass)
+
     return git.ErrorCode(ret), &cred
 }
 
@@ -671,7 +680,7 @@ func fetchRemote(ctx context.Context, repo *git.Repository) error {
     // blocking
     err = remote.Fetch([]string{refspec}, &options, "")
     if err != nil {
-        fmt.Println(err)
+        panic(err)
     }
 
 out:
