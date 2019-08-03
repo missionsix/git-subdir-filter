@@ -24,9 +24,10 @@ RUN chmod 400 /root/.ssh/id_rsa.pub
 
 RUN eval $(ssh-agent -s)
 
-# Accept the github.west domain
+# XXX Accept the github and gitlab domains
 RUN touch /root/.ssh/known_hosts
-RUN ssh-keyscan github.west.isilon.com >> /root/.ssh/known_hosts
+RUN ssh-keyscan github.com >> /root/.ssh/known_hosts
+RUN ssh-keyscan gitlab.com >> /root/.ssh/known_hosts
 
 # copy binary
 RUN mkdir /app
