@@ -40,12 +40,6 @@ Thus, the development goals of this project became:
 
  * [libgit.v27](https://github.com/libgit2/libgit2/releases/tag/v0.27.4)
 
-#### Notice
-
-The target branch *must not* be an active development branch for 
-continuous filtering. This tool currently performs a _force push_
-to the target.
-
 ## Usage
 
 ### Requirements 
@@ -78,9 +72,14 @@ and any development, from the git _source_ *OR* a _target_ clone,
 *MUST* _upstream_ git commits to the source repository for it to flow down into 
 the new _target_.
 
-
 The command should run periodically, ideally scheduled with a chron job, such
 that the tracking repository (_target_) does not drift.
+
+#### Notice
+
+The _target_ repository branch *MUST NOT* be in active development for 
+continuous filtering, as this tool effectively performs a `git push --force`
+to the target branch.
 
 ### Example command
 
