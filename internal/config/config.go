@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"path"
+	"strconv"
 	"strings"
 )
 
@@ -18,6 +19,10 @@ type Config struct {
 	TargetRepo   string
 	TargetBranch string
 	FilterDir    string
+	// SSHKey and KnownHosts are empty when unset; callers apply $HOME defaults.
+	SSHKey                string
+	KnownHosts            string
+	InsecureSkipHostCheck bool
 }
 
 // Load parses args (without the program name). Each flag defaults to its
@@ -43,6 +48,14 @@ func Load(args []string, getenv func(string) string, out io.Writer) (*Config, er
 	fs.StringVar(&c.TargetRepo, "target-repo", envOr("TARGET_REPO", ""), "target repository URL, required (env TARGET_REPO)")
 	fs.StringVar(&c.TargetBranch, "target-branch", envOr("TARGET_BRANCH", "master"), "target branch (env TARGET_BRANCH)")
 	fs.StringVar(&c.FilterDir, "filter-dir", envOr("FILTER_DIR", ""), "subdirectory to extract, required (env FILTER_DIR)")
+	fs.StringVar(&c.SSHKey, "ssh-key", envOr("SSH_KEY", ""), "SSH private key, tried after ssh-agent (env SSH_KEY; default ~/.ssh/id_ed25519, id_ecdsa, id_rsa)")
+	fs.StringVar(&c.KnownHosts, "known-hosts", envOr("KNOWN_HOSTS", ""), "known_hosts file (env KNOWN_HOSTS; default ~/.ssh/known_hosts)")
+
+	insecure, err := strconv.ParseBool(envOr("INSECURE_SKIP_HOST_CHECK", "false"))
+	if err != nil {
+		return nil, fmt.Errorf("INSECURE_SKIP_HOST_CHECK: %w", err)
+	}
+	fs.BoolVar(&c.InsecureSkipHostCheck, "insecure-skip-host-check", insecure, "do not verify SSH host keys (env INSECURE_SKIP_HOST_CHECK)")
 
 	if err := fs.Parse(args); err != nil {
 		return nil, err

@@ -28,9 +28,11 @@ func TestLoadPrecedence(t *testing.T) {
 		{
 			name: "env only",
 			env: map[string]string{"SOURCE_REPO": "es", "TARGET_REPO": "et", "FILTER_DIR": "a/b",
-				"SOURCE_BRANCH": "dev", "TARGET_BRANCH": "main", "WORKDIR": "/w"},
+				"SOURCE_BRANCH": "dev", "TARGET_BRANCH": "main", "WORKDIR": "/w",
+				"SSH_KEY": "/k", "KNOWN_HOSTS": "/kh", "INSECURE_SKIP_HOST_CHECK": "true"},
 			want: Config{WorkDir: "/w", SourceRepo: "es", SourceBranch: "dev",
-				TargetRepo: "et", TargetBranch: "main", FilterDir: "a/b"},
+				TargetRepo: "et", TargetBranch: "main", FilterDir: "a/b",
+				SSHKey: "/k", KnownHosts: "/kh", InsecureSkipHostCheck: true},
 		},
 		{
 			// Regression: TargetRepo used to read SOURCE_REPO, and flags clobbered env.
@@ -71,6 +73,7 @@ func TestLoadErrors(t *testing.T) {
 		{"missing filter", []string{"-source-repo=s", "-target-repo=t"}, nil, "-filter-dir is required"},
 		{"root filter", []string{"-source-repo=s", "-target-repo=t", "-filter-dir=/"}, nil, "must name a subdirectory"},
 		{"escaping filter", []string{"-source-repo=s", "-target-repo=t", "-filter-dir=../x"}, nil, "must name a subdirectory"},
+		{"bad bool env", required, map[string]string{"INSECURE_SKIP_HOST_CHECK": "maybe"}, "INSECURE_SKIP_HOST_CHECK"},
 		{"stray arg", append(required, "extra"), nil, "unexpected arguments"},
 	}
 	for _, tt := range tests {

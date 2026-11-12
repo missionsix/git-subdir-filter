@@ -1,0 +1,188 @@
+// Package remote fetches from and pushes to git remotes with SSH key or agent
+// authentication and known_hosts host-key verification.
+package remote
+
+import (
+	"errors"
+	"fmt"
+	"net"
+	"net/url"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+
+	git "github.com/libgit2/git2go/v34"
+	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/knownhosts"
+)
+
+// Auth configures credentials and host verification for SSH remotes.
+type Auth struct {
+	// KeyPath is a private key; empty means the first of ~/.ssh/id_ed25519,
+	// id_ecdsa, id_rsa that exists. "<KeyPath>.pub" is used when present.
+	KeyPath    string
+	Passphrase string
+	// UseAgent tries ssh-agent (SSH_AUTH_SOCK) before the key file.
+	UseAgent bool
+	// KnownHosts lists known_hosts files; InsecureSkipHostCheck disables the check.
+	KnownHosts            []string
+	InsecureSkipHostCheck bool
+}
+
+// DefaultKeyPath returns the first conventional private key under home, or "".
+func DefaultKeyPath(home string) string {
+	for _, name := range []string{"id_ed25519", "id_ecdsa", "id_rsa"} {
+		p := filepath.Join(home, ".ssh", name)
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// Fetch fetches refspec from url through the remote called name.
+func Fetch(repo *git.Repository, name, url, refspec string, auth Auth) error {
+	r, err := ensure(repo, name, url)
+	if err != nil {
+		return err
+	}
+	defer r.Free()
+	cbs, err := auth.Callbacks(url)
+	if err != nil {
+		return err
+	}
+	return r.Fetch([]string{refspec}, &git.FetchOptions{
+		DownloadTags:    git.DownloadTagsNone,
+		RemoteCallbacks: cbs,
+	}, "")
+}
+
+// Push pushes refspec to url through the remote called name.
+func Push(repo *git.Repository, name, url, refspec string, auth Auth) error {
+	r, err := ensure(repo, name, url)
+	if err != nil {
+		return err
+	}
+	defer r.Free()
+	cbs, err := auth.Callbacks(url)
+	if err != nil {
+		return err
+	}
+	return r.Push([]string{refspec}, &git.PushOptions{RemoteCallbacks: cbs})
+}
+
+// ensure returns the named remote, creating it or updating its URL.
+func ensure(repo *git.Repository, name, url string) (*git.Remote, error) {
+	if _, err := repo.Remotes.Lookup(name); err != nil {
+		return repo.Remotes.Create(name, url)
+	}
+	if err := repo.Remotes.SetUrl(name, url); err != nil {
+		return nil, err
+	}
+	return repo.Remotes.Lookup(name)
+}
+
+// Callbacks builds libgit2 callbacks for one remote URL.
+func (a Auth) Callbacks(remoteURL string) (git.RemoteCallbacks, error) {
+	var hostCB ssh.HostKeyCallback
+	if !a.InsecureSkipHostCheck && isSSH(remoteURL) {
+		var files []string
+		for _, f := range a.KnownHosts {
+			if _, err := os.Stat(f); err == nil {
+				files = append(files, f)
+			}
+		}
+		if len(files) == 0 {
+			return git.RemoteCallbacks{}, fmt.Errorf("no known_hosts file found in %v; add the host with ssh-keyscan", a.KnownHosts)
+		}
+		cb, err := knownhosts.New(files...)
+		if err != nil {
+			return git.RemoteCallbacks{}, err
+		}
+		hostCB = cb
+	}
+	port := sshPort(remoteURL)
+
+	return git.RemoteCallbacks{
+		CredentialsCallback: a.credentials(),
+		CertificateCheckCallback: func(cert *git.Certificate, valid bool, host string) error {
+			return checkCert(cert, valid, host, port, hostCB, a.InsecureSkipHostCheck)
+		},
+	}, nil
+}
+
+func checkCert(cert *git.Certificate, valid bool, host string, port int, hostCB ssh.HostKeyCallback, insecure bool) error {
+	if insecure {
+		return nil
+	}
+	switch cert.Kind {
+	case git.CertificateHostkey:
+		if hostCB == nil {
+			return errors.New("ssh host key presented but no known_hosts configured")
+		}
+		if cert.Hostkey.SSHPublicKey == nil {
+			return fmt.Errorf("%s: libgit2 did not provide the raw host key", host)
+		}
+		addr := net.JoinHostPort(host, strconv.Itoa(port))
+		placeholder := &net.TCPAddr{IP: net.IPv4zero, Port: port} // knownhosts prefers addr
+		if err := hostCB(addr, placeholder, cert.Hostkey.SSHPublicKey); err != nil {
+			return fmt.Errorf("host key verification failed for %s: %w", addr, err)
+		}
+		return nil
+	default: // X.509 (HTTPS): defer to libgit2's validation.
+		if !valid {
+			return fmt.Errorf("%s: TLS certificate not trusted", host)
+		}
+		return nil
+	}
+}
+
+// credentials yields at most one credential per method; libgit2 calls again
+// after each failure, so a bad key ends in an error instead of a loop.
+func (a Auth) credentials() git.CredentialsCallback {
+	tried := map[string]bool{}
+	return func(_ string, user string, allowed git.CredentialType) (*git.Credential, error) {
+		if user == "" {
+			user = "git"
+		}
+		if allowed&git.CredentialTypeUsername != 0 && !tried["username"] {
+			tried["username"] = true
+			return git.NewCredentialUsername(user)
+		}
+		if allowed&git.CredentialTypeSSHKey == 0 {
+			return nil, fmt.Errorf("remote requires unsupported credential type %v", allowed)
+		}
+		if a.UseAgent && os.Getenv("SSH_AUTH_SOCK") != "" && !tried["agent"] {
+			tried["agent"] = true
+			return git.NewCredentialSSHKeyFromAgent(user)
+		}
+		if a.KeyPath != "" && !tried["key"] {
+			tried["key"] = true
+			pub := a.KeyPath + ".pub"
+			if _, err := os.Stat(pub); err != nil {
+				pub = "" // libssh2 derives it from the private key
+			}
+			return git.NewCredentialSSHKey(user, pub, a.KeyPath, a.Passphrase)
+		}
+		return nil, errors.New("ssh authentication failed: no usable agent identity or key")
+	}
+}
+
+// isSSH reports whether u uses SSH, including scp-style "git@host:path".
+func isSSH(u string) bool {
+	if strings.HasPrefix(u, "ssh://") || strings.HasPrefix(u, "git+ssh://") || strings.HasPrefix(u, "ssh+git://") {
+		return true
+	}
+	return !strings.Contains(u, "://") && strings.Contains(u, ":")
+}
+
+// sshPort returns the port from an ssh:// URL, or 22.
+func sshPort(u string) int {
+	if p, err := url.Parse(u); err == nil && p.Port() != "" {
+		if n, err := strconv.Atoi(p.Port()); err == nil {
+			return n
+		}
+	}
+	return 22
+}
