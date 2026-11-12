@@ -5,8 +5,7 @@ FROM golang:1.22-alpine AS go
 FROM alpine:3.8 AS builder
 
 # Update and grab build packages
-RUN apk update && \
-    apk add --no-cache openssh-client git alpine-sdk libgit2-dev
+RUN apk add --no-cache openssh-client git alpine-sdk 'libgit2-dev~=0.27'
 
 COPY --from=go /usr/local/go /usr/local/go
 ENV PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local
@@ -15,13 +14,12 @@ ENV PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local
 WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
-COPY git-subdir-filter.go .
-RUN go build -o git-subdir-filter .
+COPY cmd/ cmd/
+RUN go build -o git-subdir-filter ./cmd/git-subdir-filter
 
 FROM alpine:3.8
 # Update and get runtime packages
-RUN apk update && \
-    apk add --no-cache openssh-client libgit2>=0.27
+RUN apk add --no-cache openssh-client 'libgit2~=0.27'
 
 RUN mkdir /root/.ssh/
 COPY id_rsa.pub /root/.ssh/
