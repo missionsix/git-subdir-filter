@@ -30,7 +30,7 @@ import (
 	"flag"
 	"fmt"
 	"github.com/caarlos0/env"
-	"github.com/libgit2/git2go/v27"
+	"github.com/libgit2/git2go/v34"
 	"os"
 	"os/signal"
 	"runtime"
@@ -618,7 +618,7 @@ func readInputRevisions(ctx context.Context, wg *sync.WaitGroup,
 }
 
 // credCheckCallback uses the runtime users ssh rsa keys to talk to the target repo
-func credCheckCallback(url string, user string, allowedTypes git.CredType) (git.ErrorCode, *git.Cred) {
+func credCheckCallback(url string, user string, allowedTypes git.CredentialType) (*git.Credential, error) {
 	home := os.Getenv("HOME")
 	pass := os.Getenv("SSH_PASSKEY")
 	pub := fmt.Sprintf("%s/.ssh/id_rsa.pub", home)
@@ -627,18 +627,13 @@ func credCheckCallback(url string, user string, allowedTypes git.CredType) (git.
 	fmt.Println("Public key:", pub)
 	fmt.Println("Private key:", priv)
 
-	ret, cred := git.NewCredSshKey(user, pub, priv, pass)
-
-	return git.ErrorCode(ret), &cred
+	return git.NewCredentialSSHKey(user, pub, priv, pass)
 }
 
 // FIXME
-func certCheckCallback(c *git.Certificate, valid bool, h string) git.ErrorCode {
+func certCheckCallback(c *git.Certificate, valid bool, h string) error {
 	// need to validate host
-	//if !valid {
-	//  return git.ErrUser
-	//}
-	return git.ErrOk
+	return nil
 }
 
 // fetchRemote performs a blocking fetch from repository for the

@@ -4,7 +4,7 @@ go 1.22
 
 require (
 	github.com/caarlos0/env v3.5.0+incompatible
-	github.com/libgit2/git2go/v27 v27.14.7
+	github.com/libgit2/git2go/v34 v34.0.0
 )
 
 require (
