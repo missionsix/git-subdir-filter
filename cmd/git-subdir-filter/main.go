@@ -29,11 +29,10 @@ import (
 	"errors"
 	"flag"
 	"fmt"
-	"github.com/caarlos0/env"
 	"github.com/libgit2/git2go/v34"
+	"github.com/missionsix/git-subdir-filter/internal/config"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"sync"
 	"syscall"
@@ -53,16 +52,6 @@ const (
 	RESUME_TAG          = "resume_filter_tag"
 	RESUME_COMMIT       = "resume_commit"
 )
-
-type Config struct {
-	WorkDir         string `env:"WORKDIR" envDefault:"${PWD}/work" envExpand:"true"`
-	SourceRepo      string `env:"SOURCE_REPO"`
-	SourceBranch    string `env:"SOURCE_BRANCH"`
-	TargetRepo      string `env:"SOURCE_REPO"`
-	TargetBranch    string `env:"TARGET_BRANCH"`
-	FilterDirectory string `env:"FILTER_DIR"`
-	WorkerCount     int
-}
 
 type commitTree struct {
 	List *list.List
@@ -293,11 +282,11 @@ func rewriteWorkers(ctx context.Context, wg *sync.WaitGroup,
 	commits <-chan *commitItem, publish chan<- bool) {
 	var treeGroup sync.WaitGroup
 
-	cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
+	cfg := ctx.Value(RUNTIME_CONFIG).(*config.Config)
 
-	fmt.Printf("Starting %d tree workers...\n", cfg.WorkerCount)
-	treeGroup.Add(cfg.WorkerCount)
-	for i := 0; i < cfg.WorkerCount; i++ {
+	fmt.Printf("Starting %d tree workers...\n", cfg.Workers)
+	treeGroup.Add(cfg.Workers)
+	for i := 0; i < cfg.Workers; i++ {
 		go treeWorker(ctx, &treeGroup, commits)
 	}
 
@@ -374,7 +363,7 @@ func filterWorker(ctx context.Context, wg *sync.WaitGroup,
 
 	defer wg.Done()
 
-	cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
+	cfg := ctx.Value(RUNTIME_CONFIG).(*config.Config)
 	repo := ctx.Value(RUNTIME_SOURCE_REPO).(*git.Repository)
 
 loop:
@@ -398,7 +387,7 @@ loop:
 			diffOptions := &git.DiffOptions{
 				Flags:            git.DiffNormal,
 				IgnoreSubmodules: git.SubmoduleIgnoreAll,
-				Pathspec:         []string{cfg.FilterDirectory},
+				Pathspec:         []string{cfg.FilterDir},
 				MaxSize:          -1,
 				NotifyCallback:   nil,
 			}
@@ -475,7 +464,7 @@ loop:
 			err = nil
 
 			// if commit tree fails to match, drop it
-			filterDirs := strings.Split(cfg.FilterDirectory, "/")
+			filterDirs := strings.Split(cfg.FilterDir, "/")
 			subtree, ok := readTree(repo, tree, filterDirs)
 			if !ok {
 				// remove element contents to be garbage collected
@@ -494,12 +483,12 @@ func filterWorkers(ctx context.Context, wg *sync.WaitGroup,
 	filterChan <-chan *commitItem, commitChan chan<- *commitItem) {
 	var filterGroup sync.WaitGroup
 
-	cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
+	cfg := ctx.Value(RUNTIME_CONFIG).(*config.Config)
 
-	fmt.Printf("Starting %d filter workers...\n", cfg.WorkerCount)
+	fmt.Printf("Starting %d filter workers...\n", cfg.Workers)
 
-	filterGroup.Add(cfg.WorkerCount)
-	for i := 0; i < cfg.WorkerCount; i++ {
+	filterGroup.Add(cfg.Workers)
+	for i := 0; i < cfg.Workers; i++ {
 		go filterWorker(ctx, &filterGroup, filterChan, commitChan)
 	}
 
@@ -574,7 +563,7 @@ func readInputRevisions(ctx context.Context, wg *sync.WaitGroup,
 		defer wg.Done()
 		defer close(inputChan)
 
-		cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
+		cfg := ctx.Value(RUNTIME_CONFIG).(*config.Config)
 		source := ctx.Value(RUNTIME_SOURCE_REPO).(*git.Repository)
 
 		// lookup resume tag from previous iteration
@@ -644,7 +633,7 @@ func fetchRemote(ctx context.Context, repo *git.Repository) error {
 	var remote *git.Remote
 	var options git.FetchOptions
 
-	cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
+	cfg := ctx.Value(RUNTIME_CONFIG).(*config.Config)
 
 	remote, err = repo.Remotes.Lookup(GIT_ORIGIN)
 	if err != nil {
@@ -685,7 +674,7 @@ func pushRemote(ctx context.Context, repo *git.Repository) error {
 	var remote *git.Remote
 	var options git.PushOptions
 
-	cfg := ctx.Value(RUNTIME_CONFIG).(*Config)
+	cfg := ctx.Value(RUNTIME_CONFIG).(*config.Config)
 
 	remote, err = repo.Remotes.Lookup(GIT_REMOTE_TARGET)
 	if err != nil {
@@ -770,7 +759,7 @@ func openRepository(path string) (*git.Repository, error) {
 }
 
 // buildEnvironment creates the set of working directories
-func buildWorkEnvironment(cfg *Config) error {
+func buildWorkEnvironment(cfg *config.Config) error {
 	var err error
 
 	err = os.MkdirAll(cfg.WorkDir, os.ModePerm)
@@ -779,66 +768,6 @@ func buildWorkEnvironment(cfg *Config) error {
 	}
 
 	return nil
-}
-
-// setupEnvironment sets the runtime
-func setupEnvironment(cfg *Config) error {
-	var workers int
-
-	sourceRepo := flag.String("source-repo", "", "Source git repository (required)")
-	sourceBranch := flag.String("source-branch", "master", "Source git branch (default: master)")
-	targetRepo := flag.String("target-repo", "", "Target git repository (required)")
-	targetBranch := flag.String("target-branch", "master", "Target git branch (default: master)")
-	filterDir := flag.String("filter-dir", "", "Filter Directory (required)")
-	workerCount := flag.Int("workers", 0, "Worker Count")
-
-	// Parse environment
-	err := env.Parse(cfg)
-	if err != nil {
-		return err
-	}
-
-	// flags override environment
-	flag.Parse()
-
-	// verify required flags
-	if *sourceRepo == "" {
-		return errors.New("-source-repo is required")
-	}
-	if *targetRepo == "" {
-		return errors.New("-target-repo is required")
-	}
-	if *filterDir == "" {
-		return errors.New("-filter-dir is required")
-	}
-
-	if *workerCount == 0 {
-		workers = runtime.NumCPU()
-		workerCount = &workers
-	}
-
-	cfg.SourceRepo = *sourceRepo
-	cfg.TargetRepo = *targetRepo
-	cfg.SourceBranch = *sourceBranch
-	cfg.TargetBranch = *targetBranch
-	cfg.FilterDirectory = *filterDir
-	cfg.WorkerCount = *workerCount
-
-	fmt.Println("Working Directory: ", cfg.WorkDir)
-	fmt.Println("Source Repository: ", cfg.SourceRepo)
-	fmt.Println("Source Branch: ", cfg.SourceBranch)
-	fmt.Println("Target Repository: ", cfg.TargetRepo)
-	fmt.Println("Target Branch: ", cfg.TargetBranch)
-	fmt.Println("Workers: ", cfg.WorkerCount)
-
-	return nil
-}
-
-func usage(err error) {
-	fmt.Fprintf(os.Stderr, "%+v\n", err)
-	flag.PrintDefaults()
-
-	os.Exit(1)
 }
 
 // Global signal handler, cancels the context
@@ -879,14 +808,16 @@ func main() {
 	var commits *commitTree
 	var cancelled bool = false
 
-	cfg := Config{}
-
-	err = setupEnvironment(&cfg)
+	cfg, err := config.Load(os.Args[1:], os.Getenv, os.Stderr)
+	if errors.Is(err, flag.ErrHelp) {
+		os.Exit(0)
+	}
 	if err != nil {
-		usage(err)
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(2)
 	}
 
-	err = buildWorkEnvironment(&cfg)
+	err = buildWorkEnvironment(cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Failed to create working directory: %s\n", err)
 		os.Exit(1)
@@ -896,7 +827,7 @@ func main() {
 	ctx := context.Background()
 	ctx, cancel := SignalHandler(ctx, &cancelled)
 
-	ctx = context.WithValue(ctx, RUNTIME_CONFIG, &cfg)
+	ctx = context.WithValue(ctx, RUNTIME_CONFIG, cfg)
 
 	// Clone and sync source repo
 	source, err = openRepository(cfg.WorkDir)
@@ -924,12 +855,12 @@ func main() {
 	// Launch sequency input processing
 	readInputRevisions(ctx, &wg, inputChan)
 
-	filterChan = make(chan *commitItem, cfg.WorkerCount)
+	filterChan = make(chan *commitItem, cfg.Workers)
 
 	// Start revision sequencer
 	stageRevisions(ctx, &wg, inputChan, filterChan)
 
-	rewriteChan = make(chan *commitItem, cfg.WorkerCount)
+	rewriteChan = make(chan *commitItem, cfg.Workers)
 
 	// Start revision filters
 	filterWorkers(ctx, &wg, filterChan, rewriteChan)
