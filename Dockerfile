@@ -1,15 +1,22 @@
-FROM golang:alpine as builder
+# Go toolchain only; its static binaries run on the older Alpine below.
+FROM golang:1.22-alpine AS go
+
+# Alpine 3.8 ships libgit2 0.27, which git2go v27 requires.
+FROM alpine:3.8 AS builder
 
 # Update and grab build packages
 RUN apk update && \
     apk add --no-cache openssh-client git alpine-sdk libgit2-dev
 
+COPY --from=go /usr/local/go /usr/local/go
+ENV PATH=/usr/local/go/bin:$PATH GOTOOLCHAIN=local
+
 # Build the tool
-RUN mkdir -p /app /go
 WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
 COPY git-subdir-filter.go .
-RUN GOPATH=/go go get -d -v ./...
-RUN GOPATH=/go go build -o git-subdir-filter .
+RUN go build -o git-subdir-filter .
 
 FROM alpine:3.8
 # Update and get runtime packages
