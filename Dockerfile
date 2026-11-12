@@ -1,7 +1,7 @@
 # libgit2 1.5 is what git2go v34 binds to; no current distro ships it, so build it.
 FROM golang:1.26-alpine3.22 AS builder
 
-RUN apk add --no-cache build-base cmake git openssl-dev libssh2-dev zlib-dev pkgconf
+RUN apk add --no-cache build-base cmake git git-subtree openssl-dev libssh2-dev zlib-dev pkgconf
 
 ARG LIBGIT2_VERSION=1.5.2
 RUN wget -qO- https://github.com/libgit2/libgit2/archive/refs/tags/v${LIBGIT2_VERSION}.tar.gz | tar xz -C /tmp && \
@@ -20,40 +20,21 @@ COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ cmd/
 COPY internal/ internal/
-RUN go build -o git-subdir-filter ./cmd/git-subdir-filter
+RUN go build -trimpath -o git-subdir-filter ./cmd/git-subdir-filter
+
+# docker build --target test .   runs vet and the test suite.
+FROM builder AS test
+RUN go vet ./... && go test -race ./...
 
 FROM alpine:3.22
-RUN apk add --no-cache openssh-client libssh2 libssl3 zlib
+RUN apk add --no-cache ca-certificates libssh2 libssl3 zlib && \
+    adduser -D -u 10001 filter && \
+    mkdir /work && chown filter:filter /work
 COPY --from=builder /usr/local/lib/libgit2.so* /usr/local/lib/
+COPY --from=builder /app/git-subdir-filter /usr/local/bin/git-subdir-filter
 
-RUN mkdir /root/.ssh/
-COPY id_rsa.pub /root/.ssh/
-COPY id_rsa /root/.ssh/
-RUN chmod 400 /root/.ssh/id_rsa
-RUN chmod 400 /root/.ssh/id_rsa.pub
-
-RUN eval $(ssh-agent -s)
-
-# XXX Accept the github and gitlab domains
-RUN touch /root/.ssh/known_hosts
-RUN ssh-keyscan github.com >> /root/.ssh/known_hosts
-RUN ssh-keyscan gitlab.com >> /root/.ssh/known_hosts
-
-# copy binary
-RUN mkdir /app
-COPY --from=builder /app/git-subdir-filter /app
-
-ARG SOURCE_BRANCH
-ARG SOURCE_REPO
-ARG TARGET_REPO
-ARG FILTER_DIR
-ARG WORKDIR
-
-WORKDIR /git
-
-# run in shell form for variable substitution
-ENTRYPOINT /app/git-subdir-filter \
-    -source-repo=$SOURCE_REPO \
-    -source-branch=$SOURCE_BRANCH \
-    -target-repo=$TARGET_REPO \
-    -filter-dir=$FILTER_DIR
+# Credentials are never baked in: mount ~/.ssh or forward SSH_AUTH_SOCK at run time.
+USER filter
+ENV WORKDIR=/work/repo
+VOLUME /work
+ENTRYPOINT ["/usr/local/bin/git-subdir-filter"]

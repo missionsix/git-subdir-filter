@@ -1,95 +1,178 @@
 # Git Subdirectory Filter
 
-`git-subdir-filter` is a command line tool which extracts a given sub directory
-from a source git repository into a separate repository.  In other words, given
-a _source_ respository, this tool takes a _sub/directory/_ argument and posts
-the contents from the root of _sub/directory_ to a *secondary* repository.
+`git-subdir-filter` extracts the history of one subdirectory from a source
+repository branch and force-pushes it to a target repository branch. The
+subdirectory becomes the root of the target.
 
-## Use Cases
+Run it once to split a project out of a monorepo, or run it on a schedule to
+keep the target as a read-only mirror of the subdirectory. Each run only
+processes commits added since the previous run.
 
-There are two main use cases.
+## How it works
 
- * Moving a snapshot of a subdirectory into it's own git repository
- * Keeping a target git repository in sync with a source's subdirectory as a read-only shadow clone
+The tool rewrites each source commit so that its tree is the subdirectory's
+tree. It keeps the author, committer, date, and message, and:
 
-Creating a new git repository allows for sub-project isolation where as tracking
-upstream changes could allow project owners to distribute independent parts of a
-larger project.
+- Drops commits that don't change the subdirectory.
+- Keeps merges where both sides changed the subdirectory.
+- Collapses merges where only one side changed it.
+- Records a commit that deletes the subdirectory as a commit with an empty tree.
 
-## Motivation
+For example, filtering `lib/foo` from this source history:
 
-The motivation for developing this tool was to solve a business use case, after
-not finding and adequite tool for the job. This led to the ideation of a more
-performant version of `git filter-branch --subdirectory-filter` and to address
-some its shortcomings.
+```
+*   merge side          (lib/foo/side added on branch)
+|\
+| * side: foo/side
+* | master: foo/a=2
+|/
+* outside prefix        (only touches README)
+* add foo/a
+* root                  (before lib/foo existed)
+```
 
-Thus, the development goals of this project became:
+produces this target history, with `a` and `side` at the root:
 
- * Implement a performant subdirectory filter command
- * Allow for subsequent commands from the same source directory to resume filtering for tracking active development.
+```
+*   merge side
+|\
+| * side: foo/side
+* | master: foo/a=2
+|/
+* add foo/a
+```
 
-## Command Features
-
- * Auto-scaling work threads based on CPU count (configurable with `-work-threads`)
- * Auto-resume filtering based on last-filtered commit
- * Uses a single working directory
- * Space saving - re-uses blob objects in working directory
- * Force-update of target repository
-
-## Build Requirements
-
- * [libgit.v27](https://github.com/libgit2/libgit2/releases/tag/v0.27.4)
+The rewrite is deterministic: the same source commit always produces the same
+target commit ID. A full re-run reproduces the target exactly, which is
+why incremental runs are safe.
 
 ## Usage
 
-### Requirements 
-
-The following is a list of requirements for running `git-subdir-filter`
-
- * A _source_ git repository branch with a desired _sub/directory_
- * A _target_ repository (can be local)
- * `rsa` keys must be in the standard `$USER/.ssh/` location
- * `SSH_PASSKEY` must be set if your private key needs unlocking
-
-
-### Snapshot a sub directory
-
-This is basically run-once. You should run the command and then you have a
-brand new target git repository to develop on.
-
-*Note* It may be possible to convert the _source sub/directory_ into a git
-module, or git external repository such that the _source_ repository loses
-ownership of the _sub/directory_ and ends up tracking the new target.
-
-### Track a sub directory
-
-This mode is the original motivation of the tool. Using this mode assumes
-the _source sub/directory_ is in active development.  The _target_ becomes
-a "clone-only" repository, and may be distributed.
-
-In this model, the source repository _retains ownership_ of the _sub/directory_,
-and any development, from the git _source_ *OR* a _target_ clone,
-*MUST* _upstream_ git commits to the source repository for it to flow down into 
-the new _target_.
-
-The command should run periodically, ideally scheduled with a chron job, such
-that the tracking repository (_target_) does not drift.
-
-#### Notice
-
-The _target_ repository branch *MUST NOT* be in active development for 
-continuous filtering, as this tool effectively performs a `git push --force`
-to the target branch.
-
-### Example command
-
 ```sh
-./git-subdir-filter -source-repo=git@github.com:missionsix/source.git
-    -source-branch=master -target-repo=git@gitlab.com:missionsix/subdir.git
-    -filter-dir=subdir
+git-subdir-filter \
+  -source-repo=git@github.com:example/monorepo.git \
+  -source-branch=main \
+  -filter-dir=lib/foo \
+  -target-repo=git@github.com:example/foo.git \
+  -target-branch=main
 ```
 
-In this example `subdir` in the repository `github.com:missionsix/source.git` is
-to be extracted and pushed to the target repository
-`github.com:missionsix/subdir.git`.
+The tool fetches `main` from the monorepo into the work directory, rewrites
+the history of `lib/foo`, and force-pushes the result to `main` in `foo.git`.
 
+### Options
+
+Each flag can also be set with an environment variable. Flags take
+precedence over environment variables.
+
+| Flag | Environment variable | Default | Description |
+|------|----------------------|---------|-------------|
+| `-source-repo` | `SOURCE_REPO` | required | Source repository URL. |
+| `-source-branch` | `SOURCE_BRANCH` | `master` | Source branch to read. |
+| `-filter-dir` | `FILTER_DIR` | required | Subdirectory to extract, for example `lib/foo`. |
+| `-target-repo` | `TARGET_REPO` | required | Target repository URL. |
+| `-target-branch` | `TARGET_BRANCH` | `master` | Target branch to force-push. |
+| `-work-dir` | `WORKDIR` | `./work` | Bare repository that holds fetched objects and resume state. |
+| `-ssh-key` | `SSH_KEY` | first of `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa` | Private key, tried after ssh-agent. |
+| `-known-hosts` | `KNOWN_HOSTS` | `~/.ssh/known_hosts` | File used to verify SSH host keys. |
+| `-insecure-skip-host-check` | `INSECURE_SKIP_HOST_CHECK` | `false` | Skip SSH host key verification. Not recommended. |
+| | `SSH_PASSKEY` | | Passphrase for the private key. Environment only, so it stays out of the process list. |
+
+The tool exits with `0` on success, `1` if the fetch, rewrite, or push fails,
+and `2` for invalid options.
+
+### Authentication
+
+For SSH URLs, the tool tries these methods in order:
+
+1. ssh-agent, if `SSH_AUTH_SOCK` is set.
+2. The private key from `-ssh-key`, or the default key.
+
+The tool verifies the server's host key against `known_hosts` and refuses
+to connect to unknown hosts. To add a host:
+
+```sh
+ssh-keyscan github.com >> ~/.ssh/known_hosts
+```
+
+HTTPS URLs use the system's trusted certificates.
+
+### Run with Docker
+
+The image contains no credentials. Mount your SSH directory read-only, and
+mount a volume for the work directory so later runs can resume:
+
+```sh
+docker build -t git-subdir-filter .
+
+docker run --rm \
+  -v ~/.ssh:/home/filter/.ssh:ro \
+  -v subdir-filter-work:/work \
+  -e SSH_PASSKEY \
+  git-subdir-filter \
+  -source-repo=git@github.com:example/monorepo.git \
+  -filter-dir=lib/foo \
+  -target-repo=git@github.com:example/foo.git
+```
+
+To use ssh-agent instead of a key file, forward the socket:
+
+```sh
+docker run --rm \
+  -v "$SSH_AUTH_SOCK":/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent \
+  -v ~/.ssh/known_hosts:/home/filter/.ssh/known_hosts:ro \
+  -v subdir-filter-work:/work \
+  git-subdir-filter -source-repo=... -filter-dir=lib/foo -target-repo=...
+```
+
+The container runs as UID 10001. libgit2 refuses to open repositories owned
+by another user, so if you bind-mount a host directory as `/work`, run
+with `--user "$(id -u):$(id -g)"`.
+
+## Tracking a subdirectory
+
+To keep a target in sync, run the command on a schedule, for example from
+cron or a CI job. Each run:
+
+1. Fetches the source branch.
+2. Rewrites only the commits added since the previous run.
+3. Force-pushes the target branch.
+
+Resume state is kept in the work directory, separately for each
+`-filter-dir`, so one work directory can serve several subdirectories. If the
+state is lost, the next run rewrites the full history and produces the same
+commit IDs.
+
+**Important:** Don't commit directly to the target branch. Each run
+force-pushes it, so any commit made there is overwritten. Make changes in the
+source repository instead.
+
+## Limitations
+
+- Commit signatures (GPG and SSH) aren't preserved, because the rewritten
+  commits have different content.
+- Commit messages are written as UTF-8. A custom `encoding` header is dropped.
+- The tool uses libgit2 1.5, the last version supported by
+  [git2go](https://github.com/libgit2/git2go) v34. libgit2 1.5 doesn't
+  include fixes for CVE-2024-24575 (revparse) and CVE-2024-24577
+  (`git_index_add`). The tool doesn't call either code path: it doesn't use
+  revparse and never touches the index.
+
+## Development
+
+```
+cmd/git-subdir-filter/   Command-line entry point.
+internal/config/         Flag and environment parsing.
+internal/split/          History rewrite and resume state.
+internal/remote/         Fetch, push, credentials, and host key checks.
+```
+
+Building requires Go 1.26 and libgit2 1.5 with SSH support. The Dockerfile
+builds libgit2 from source, so the easiest way to run the checks is:
+
+```sh
+docker build --target test .
+```
+
+The `internal/split` tests compare results against `git subtree split` when
+`git subtree` is installed. The builder image includes it.

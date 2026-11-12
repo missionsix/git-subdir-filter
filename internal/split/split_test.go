@@ -256,40 +256,58 @@ func TestCancelled(t *testing.T) {
 	}
 }
 
-// TestMatchesGitSubtree cross-checks the tip tree and linear history against
+// TestMatchesGitSubtree cross-checks tip trees and commit counts against
 // `git subtree split`, when available.
 func TestMatchesGitSubtree(t *testing.T) {
 	if out, _ := exec.Command("git", "subtree", "-h").CombinedOutput(); !strings.Contains(string(out), "split") {
 		t.Skip("git subtree not installed")
 	}
-	f := newFixture(t)
-	c1 := f.commit("root", map[string]string{"README": "r"})
-	c2 := f.commit("add foo", map[string]string{"README": "r", "lib/foo/a": "1"}, c1)
-	c3 := f.commit("outside", map[string]string{"README": "r2", "lib/foo/a": "1"}, c2)
-	c4 := f.commit("edit foo", map[string]string{"README": "r2", "lib/foo/a": "2", "lib/foo/d/b": "b"}, c3)
-	res := f.split("lib/foo", c4)
-
-	run := func(args ...string) string {
-		cmd := exec.Command("git", args...)
-		cmd.Dir = f.dir
-		cmd.Env = append(os.Environ(), "GIT_DIR="+f.dir)
-		out, err := cmd.CombinedOutput()
-		if err != nil {
-			t.Fatalf("git %v: %v\n%s", args, err, out)
-		}
-		return strings.TrimSpace(string(out))
+	histories := map[string]func(f *fixture) *git.Oid{
+		"linear": func(f *fixture) *git.Oid {
+			c1 := f.commit("root", map[string]string{"README": "r"})
+			c2 := f.commit("add foo", map[string]string{"README": "r", "lib/foo/a": "1"}, c1)
+			c3 := f.commit("outside", map[string]string{"README": "r2", "lib/foo/a": "1"}, c2)
+			return f.commit("edit foo", map[string]string{"README": "r2", "lib/foo/a": "2", "lib/foo/d/b": "b"}, c3)
+		},
+		"merge": func(f *fixture) *git.Oid {
+			base := f.commit("base", map[string]string{"lib/foo/a": "1"})
+			m := f.commit("m", map[string]string{"lib/foo/a": "2"}, base)
+			s := f.commit("s", map[string]string{"lib/foo/a": "1", "lib/foo/s": "s"}, base)
+			return f.commit("merge", map[string]string{"lib/foo/a": "2", "lib/foo/s": "s"}, m, s)
+		},
 	}
-	ref, _ := f.repo.References.Create("refs/heads/src", c4, true, "")
-	defer ref.Free()
-	want := run("subtree", "split", "--prefix=lib/foo", "src")
-	wantTree := run("rev-parse", want+"^{tree}")
-	wantCount := run("rev-list", "--count", want)
+	for name, build := range histories {
+		t.Run(name, func(t *testing.T) {
+			f := newFixture(t)
+			tip := build(f)
+			res := f.split("lib/foo", tip)
+			ref, err := f.repo.References.Create("refs/heads/src", tip, true, "")
+			must(t, err)
+			ref.Free()
 
-	head, _ := f.repo.LookupCommit(res.Head)
-	if head.TreeId().String() != wantTree {
-		t.Errorf("tip tree %s, git subtree %s", head.TreeId(), wantTree)
-	}
-	if got := run("rev-list", "--count", res.Head.String()); got != wantCount {
-		t.Errorf("commit count %s, git subtree %s", got, wantCount)
+			// git subtree needs a working tree, so run it in a clone.
+			wt := t.TempDir()
+			git := func(dir string, args ...string) string {
+				var stderr strings.Builder
+				cmd := exec.Command("git", append([]string{"-C", dir}, args...)...)
+				cmd.Stderr = &stderr // subtree prints progress here
+				out, err := cmd.Output()
+				if err != nil {
+					t.Fatalf("git %v: %v\n%s", args, err, stderr.String())
+				}
+				return strings.TrimSpace(string(out))
+			}
+			git(wt, "clone", "-q", "--branch=src", f.dir, ".")
+			want := git(wt, "subtree", "split", "--prefix=lib/foo", "HEAD")
+
+			head, err := f.repo.LookupCommit(res.Head)
+			must(t, err)
+			if wantTree := git(wt, "rev-parse", want+"^{tree}"); head.TreeId().String() != wantTree {
+				t.Errorf("tip tree %s, git subtree %s", head.TreeId(), wantTree)
+			}
+			if got, want := git(f.dir, "rev-list", "--count", res.Head.String()), git(wt, "rev-list", "--count", want); got != want {
+				t.Errorf("commit count %s, git subtree %s", got, want)
+			}
+		})
 	}
 }
