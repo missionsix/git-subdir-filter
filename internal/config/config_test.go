@@ -2,7 +2,6 @@ package config
 
 import (
 	"io"
-	"runtime"
 	"strings"
 	"testing"
 )
@@ -24,14 +23,14 @@ func TestLoadPrecedence(t *testing.T) {
 			name: "defaults",
 			args: required,
 			want: Config{WorkDir: "work", SourceRepo: "s", SourceBranch: "master",
-				TargetRepo: "t", TargetBranch: "master", FilterDir: "d", Workers: runtime.NumCPU()},
+				TargetRepo: "t", TargetBranch: "master", FilterDir: "d"},
 		},
 		{
 			name: "env only",
 			env: map[string]string{"SOURCE_REPO": "es", "TARGET_REPO": "et", "FILTER_DIR": "a/b",
-				"SOURCE_BRANCH": "dev", "TARGET_BRANCH": "main", "WORKDIR": "/w", "WORKERS": "3"},
+				"SOURCE_BRANCH": "dev", "TARGET_BRANCH": "main", "WORKDIR": "/w"},
 			want: Config{WorkDir: "/w", SourceRepo: "es", SourceBranch: "dev",
-				TargetRepo: "et", TargetBranch: "main", FilterDir: "a/b", Workers: 3},
+				TargetRepo: "et", TargetBranch: "main", FilterDir: "a/b"},
 		},
 		{
 			// Regression: TargetRepo used to read SOURCE_REPO, and flags clobbered env.
@@ -39,13 +38,13 @@ func TestLoadPrecedence(t *testing.T) {
 			args: []string{"-target-repo=ft"},
 			env:  map[string]string{"SOURCE_REPO": "es", "TARGET_REPO": "et", "FILTER_DIR": "d"},
 			want: Config{WorkDir: "work", SourceRepo: "es", SourceBranch: "master",
-				TargetRepo: "ft", TargetBranch: "master", FilterDir: "d", Workers: runtime.NumCPU()},
+				TargetRepo: "ft", TargetBranch: "master", FilterDir: "d"},
 		},
 		{
 			name: "filter dir normalized",
 			args: []string{"-source-repo=s", "-target-repo=t", "-filter-dir=/lib//foo/"},
 			want: Config{WorkDir: "work", SourceRepo: "s", SourceBranch: "master",
-				TargetRepo: "t", TargetBranch: "master", FilterDir: "lib/foo", Workers: runtime.NumCPU()},
+				TargetRepo: "t", TargetBranch: "master", FilterDir: "lib/foo"},
 		},
 	}
 	for _, tt := range tests {
@@ -72,7 +71,6 @@ func TestLoadErrors(t *testing.T) {
 		{"missing filter", []string{"-source-repo=s", "-target-repo=t"}, nil, "-filter-dir is required"},
 		{"root filter", []string{"-source-repo=s", "-target-repo=t", "-filter-dir=/"}, nil, "must name a subdirectory"},
 		{"escaping filter", []string{"-source-repo=s", "-target-repo=t", "-filter-dir=../x"}, nil, "must name a subdirectory"},
-		{"bad WORKERS", required, map[string]string{"WORKERS": "many"}, "WORKERS"},
 		{"stray arg", append(required, "extra"), nil, "unexpected arguments"},
 	}
 	for _, tt := range tests {

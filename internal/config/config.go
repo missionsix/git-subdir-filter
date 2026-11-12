@@ -7,8 +7,6 @@ import (
 	"fmt"
 	"io"
 	"path"
-	"runtime"
-	"strconv"
 	"strings"
 )
 
@@ -20,7 +18,6 @@ type Config struct {
 	TargetRepo   string
 	TargetBranch string
 	FilterDir    string
-	Workers      int
 }
 
 // Load parses args (without the program name). Each flag defaults to its
@@ -47,20 +44,11 @@ func Load(args []string, getenv func(string) string, out io.Writer) (*Config, er
 	fs.StringVar(&c.TargetBranch, "target-branch", envOr("TARGET_BRANCH", "master"), "target branch (env TARGET_BRANCH)")
 	fs.StringVar(&c.FilterDir, "filter-dir", envOr("FILTER_DIR", ""), "subdirectory to extract, required (env FILTER_DIR)")
 
-	workers, err := strconv.Atoi(envOr("WORKERS", "0"))
-	if err != nil {
-		return nil, fmt.Errorf("WORKERS: %w", err)
-	}
-	fs.IntVar(&c.Workers, "workers", workers, "worker count, 0 = CPU count (env WORKERS)")
-
 	if err := fs.Parse(args); err != nil {
 		return nil, err
 	}
 	if fs.NArg() > 0 {
 		return nil, fmt.Errorf("unexpected arguments: %v", fs.Args())
-	}
-	if c.Workers <= 0 {
-		c.Workers = runtime.NumCPU()
 	}
 	if err := c.validate(); err != nil {
 		return nil, err

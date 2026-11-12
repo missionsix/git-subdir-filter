@@ -19,6 +19,7 @@ WORKDIR /app
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/ cmd/
+COPY internal/ internal/
 RUN go build -o git-subdir-filter ./cmd/git-subdir-filter
 
 FROM alpine:3.22

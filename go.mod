@@ -1,6 +1,6 @@
 module github.com/missionsix/git-subdir-filter
 
-go 1.22
+go 1.24
 
 require github.com/libgit2/git2go/v34 v34.0.0
 
