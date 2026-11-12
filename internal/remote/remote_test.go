@@ -1,6 +1,7 @@
 package remote
 
 import (
+	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"os"
@@ -77,10 +78,10 @@ func TestCheckCert(t *testing.T) {
 
 func TestCallbacksRequireKnownHostsForSSH(t *testing.T) {
 	a := Auth{KnownHosts: []string{filepath.Join(t.TempDir(), "missing")}}
-	if _, err := a.Callbacks("git@github.com:o/r.git"); err == nil || !strings.Contains(err.Error(), "no known_hosts") {
+	if _, err := a.Callbacks(context.Background(), "git@github.com:o/r.git"); err == nil || !strings.Contains(err.Error(), "no known_hosts") {
 		t.Fatalf("ssh url: err = %v, want missing known_hosts error", err)
 	}
-	if _, err := a.Callbacks("file:///tmp/r"); err != nil {
+	if _, err := a.Callbacks(context.Background(), "file:///tmp/r"); err != nil {
 		t.Fatalf("file url should not need known_hosts: %v", err)
 	}
 }
@@ -105,7 +106,8 @@ func TestCredentialsStopAfterEachMethod(t *testing.T) {
 func TestURLHelpers(t *testing.T) {
 	for u, want := range map[string]bool{
 		"git@github.com:o/r.git": true, "ssh://git@h:2222/r": true, "https://h/r": false,
-		"file:///r": false, "/abs/path": false,
+		"file:///r": false, "/abs/path": false, "/srv/team:mono.git": false, "./a:b": false,
+		"host:repo.git": true,
 	} {
 		if got := isSSH(u); got != want {
 			t.Errorf("isSSH(%q) = %v, want %v", u, got, want)
@@ -151,16 +153,17 @@ func TestFetchPushRoundTrip(t *testing.T) {
 	id, err := src.CreateCommitFromIds("refs/heads/main", sig, sig, "c", tree)
 	must(t, err)
 
-	must(t, Fetch(work, "origin", "file://"+filepath.Join(dir, "src"), "+refs/heads/main:refs/remotes/origin/main", Auth{}))
-	must(t, Push(work, "target", "file://"+filepath.Join(dir, "dst"), "+refs/remotes/origin/main:refs/heads/out", Auth{}))
+	ctx := context.Background()
+	must(t, Fetch(ctx, work, "file://"+filepath.Join(dir, "src"), "+refs/heads/main:refs/remotes/origin/main", Auth{}))
+	must(t, Push(ctx, work, "file://"+filepath.Join(dir, "dst"), "+refs/remotes/origin/main:refs/heads/out", Auth{}))
 
 	ref, err := dst.References.Lookup("refs/heads/out")
 	must(t, err)
 	if !ref.Target().Equal(id) {
 		t.Fatalf("dst out = %s, want %s", ref.Target(), id)
 	}
-	// Changing the URL of an existing remote must take effect.
-	err = Push(work, "target", "file://"+filepath.Join(dir, "nope"), "+refs/remotes/origin/main:refs/heads/out", Auth{})
+	// Each call uses its URL, not a remembered remote.
+	err = Push(ctx, work, "file://"+filepath.Join(dir, "nope"), "+refs/remotes/origin/main:refs/heads/out", Auth{})
 	if err == nil {
 		t.Fatal("push to missing repo succeeded; remote URL not updated")
 	}
@@ -170,5 +173,42 @@ func must(t *testing.T, err error) {
 	t.Helper()
 	if err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestRejectedRef(t *testing.T) {
+	if err := rejectedRef("refs/heads/main", ""); err != nil {
+		t.Fatalf("accepted ref: %v", err)
+	}
+	err := rejectedRef("refs/heads/main", "pre-receive hook declined")
+	if err == nil || !strings.Contains(err.Error(), "pre-receive hook declined") {
+		t.Fatalf("err = %v, want rejection with status", err)
+	}
+}
+
+func TestFetchCancelled(t *testing.T) {
+	dir := t.TempDir()
+	src, err := git.InitRepository(filepath.Join(dir, "src"), true)
+	must(t, err)
+	defer src.Free()
+	tb, err := src.TreeBuilder()
+	must(t, err)
+	blob, err := src.CreateBlobFromBuffer(make([]byte, 1<<20))
+	must(t, err)
+	must(t, tb.Insert("big", blob, git.FilemodeBlob))
+	tree, err := tb.Write()
+	must(t, err)
+	sig := &git.Signature{Name: "t", Email: "t@t", When: time.Unix(1_600_000_000, 0)}
+	_, err = src.CreateCommitFromIds("refs/heads/main", sig, sig, "c", tree)
+	must(t, err)
+
+	work, err := git.InitRepository(filepath.Join(dir, "work"), true)
+	must(t, err)
+	defer work.Free()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	err = Fetch(ctx, work, "file://"+filepath.Join(dir, "src"), "+refs/heads/main:refs/remotes/origin/main", Auth{})
+	if err == nil {
+		t.Fatal("fetch with cancelled context succeeded")
 	}
 }

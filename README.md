@@ -72,14 +72,16 @@ precedence over environment variables.
 | `-filter-dir` | `FILTER_DIR` | required | Subdirectory to extract, for example `lib/foo`. |
 | `-target-repo` | `TARGET_REPO` | required | Target repository URL. |
 | `-target-branch` | `TARGET_BRANCH` | `master` | Target branch to force-push. |
-| `-work-dir` | `WORKDIR` | `./work` | Bare repository that holds fetched objects and resume state. |
+| `-work-dir` | `WORKDIR` | `./work` | Bare repository that holds fetched objects and resume state. Must be empty or an existing work repository. |
 | `-ssh-key` | `SSH_KEY` | first of `~/.ssh/id_ed25519`, `id_ecdsa`, `id_rsa` | Private key, tried after ssh-agent. |
 | `-known-hosts` | `KNOWN_HOSTS` | `~/.ssh/known_hosts` | File used to verify SSH host keys. |
 | `-insecure-skip-host-check` | `INSECURE_SKIP_HOST_CHECK` | `false` | Skip SSH host key verification. Not recommended. |
 | | `SSH_PASSKEY` | | Passphrase for the private key. Environment only, so it stays out of the process list. |
 
-The tool exits with `0` on success, `1` if the fetch, rewrite, or push fails,
-and `2` for invalid options.
+The tool exits with `0` on success, `1` if the fetch, rewrite, or push fails
+(including a push the target rejects, such as a protected branch), and `2`
+for invalid options. The first SIGINT or SIGTERM stops a run cleanly; a second
+one kills it.
 
 ### Authentication
 
@@ -99,15 +101,18 @@ HTTPS URLs use the system's trusted certificates.
 
 ### Run with Docker
 
-The image contains no credentials. Mount your SSH directory read-only, and
-mount a volume for the work directory so later runs can resume:
+The image contains no credentials. Run the container as your own user so it
+can read your SSH files, which are usually readable only by you. Mount a host
+directory as `/work` so later runs can resume:
 
 ```sh
 docker build -t git-subdir-filter .
 
+mkdir -p ~/subdir-filter-work
 docker run --rm \
+  --user "$(id -u):$(id -g)" -e HOME=/home/filter \
   -v ~/.ssh:/home/filter/.ssh:ro \
-  -v subdir-filter-work:/work \
+  -v ~/subdir-filter-work:/work \
   -e SSH_PASSKEY \
   git-subdir-filter \
   -source-repo=git@github.com:example/monorepo.git \
@@ -115,19 +120,19 @@ docker run --rm \
   -target-repo=git@github.com:example/foo.git
 ```
 
+`-e HOME=/home/filter` is needed because your UID has no account inside the
+image; without it, the tool looks for `/.ssh`.
+
 To use ssh-agent instead of a key file, forward the socket:
 
 ```sh
 docker run --rm \
+  --user "$(id -u):$(id -g)" -e HOME=/home/filter \
   -v "$SSH_AUTH_SOCK":/ssh-agent -e SSH_AUTH_SOCK=/ssh-agent \
   -v ~/.ssh/known_hosts:/home/filter/.ssh/known_hosts:ro \
-  -v subdir-filter-work:/work \
+  -v ~/subdir-filter-work:/work \
   git-subdir-filter -source-repo=... -filter-dir=lib/foo -target-repo=...
 ```
-
-The container runs as UID 10001. libgit2 refuses to open repositories owned
-by another user, so if you bind-mount a host directory as `/work`, run
-with `--user "$(id -u):$(id -g)"`.
 
 ## Tracking a subdirectory
 
@@ -138,10 +143,11 @@ cron or a CI job. Each run:
 2. Rewrites only the commits added since the previous run.
 3. Force-pushes the target branch.
 
-Resume state is kept in the work directory, separately for each
-`-filter-dir`, so one work directory can serve several subdirectories. If the
-state is lost, the next run rewrites the full history and produces the same
-commit IDs.
+Resume state and refs are kept in the work directory, separately for each
+combination of source URL, source branch, and `-filter-dir`. One work
+directory can serve several jobs, including jobs that run at the same time.
+If the state is lost, the next run rewrites the full history and produces the
+same commit IDs.
 
 **Important:** Don't commit directly to the target branch. Each run
 force-pushes it, so any commit made there is overwritten. Make changes in the

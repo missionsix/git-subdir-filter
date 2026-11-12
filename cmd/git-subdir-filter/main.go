@@ -26,13 +26,6 @@ import (
 	"github.com/missionsix/git-subdir-filter/internal/split"
 )
 
-const (
-	sourceRemote = "origin"
-	targetRemote = "target"
-	// workBranch holds the rewritten history inside the work repository.
-	workBranch = "refs/heads/incoming"
-)
-
 func main() {
 	os.Exit(run())
 }
@@ -50,6 +43,7 @@ func run() int {
 	log := slog.New(slog.NewTextHandler(os.Stderr, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
+	context.AfterFunc(ctx, stop) // a second signal kills the process
 
 	if err := mirror(ctx, cfg, log); err != nil {
 		log.Error("failed", "err", err)
@@ -72,10 +66,13 @@ func mirror(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 	}
 	defer repo.Free()
 
-	tracking := fmt.Sprintf("refs/remotes/%s/%s", sourceRemote, cfg.SourceBranch)
+	// Refs are namespaced per source/branch/prefix so jobs can share a work dir.
+	mapPath, ns := split.StateLocations(cfg.WorkDir, cfg.SourceRepo, cfg.SourceBranch, cfg.FilterDir)
+	tracking, workRef := ns+"source", ns+"head"
+
 	fetchSpec := fmt.Sprintf("+refs/heads/%s:%s", cfg.SourceBranch, tracking)
 	log.Info("fetching", "refspec", fetchSpec)
-	if err := remote.Fetch(repo, sourceRemote, cfg.SourceRepo, fetchSpec, auth(cfg)); err != nil {
+	if err := remote.Fetch(ctx, repo, cfg.SourceRepo, fetchSpec, auth(cfg)); err != nil {
 		return fmt.Errorf("fetch %s: %w", cfg.SourceRepo, err)
 	}
 	tip, err := resolve(repo, tracking)
@@ -83,8 +80,7 @@ func mirror(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return err
 	}
 
-	mapPath, stateRef := split.StateLocations(cfg.WorkDir, cfg.FilterDir)
-	s := &split.Splitter{Repo: repo, Prefix: cfg.FilterDir, MapPath: mapPath, StateRef: stateRef, Log: log}
+	s := &split.Splitter{Repo: repo, Prefix: cfg.FilterDir, MapPath: mapPath, StateRef: ns + "source-tip", Log: log}
 	res, err := s.Split(ctx, tip)
 	if err != nil {
 		return err
@@ -93,15 +89,15 @@ func mirror(ctx context.Context, cfg *config.Config, log *slog.Logger) error {
 		return fmt.Errorf("%q does not exist in %s", cfg.FilterDir, cfg.SourceBranch)
 	}
 
-	ref, err := repo.References.Create(workBranch, res.Head, true, "subdir-filter")
+	ref, err := repo.References.Create(workRef, res.Head, true, "subdir-filter")
 	if err != nil {
-		return fmt.Errorf("update %s: %w", workBranch, err)
+		return fmt.Errorf("update %s: %w", workRef, err)
 	}
 	ref.Free()
 
-	pushSpec := fmt.Sprintf("+%s:refs/heads/%s", workBranch, cfg.TargetBranch)
+	pushSpec := fmt.Sprintf("+%s:refs/heads/%s", workRef, cfg.TargetBranch)
 	log.Info("pushing", "head", res.Head.String(), "refspec", pushSpec)
-	if err := remote.Push(repo, targetRemote, cfg.TargetRepo, pushSpec, auth(cfg)); err != nil {
+	if err := remote.Push(ctx, repo, cfg.TargetRepo, pushSpec, auth(cfg)); err != nil {
 		return fmt.Errorf("push %s: %w", cfg.TargetRepo, err)
 	}
 	return nil
@@ -127,10 +123,22 @@ func auth(cfg *config.Config) remote.Auth {
 	return a
 }
 
+// openOrInit opens the work repository, creating a bare one only in an
+// empty directory so an unrelated directory is never written into.
 func openOrInit(path string) (*git.Repository, error) {
-	repo, err := git.OpenRepository(path)
+	repo, err := git.OpenRepositoryExtended(path, git.RepositoryOpenNoSearch, "")
 	if err == nil {
 		return repo, nil
+	}
+	if !git.IsErrorCode(err, git.ErrorCodeNotFound) {
+		return nil, fmt.Errorf("open work dir %s: %w", path, err)
+	}
+	entries, rerr := os.ReadDir(path)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if len(entries) > 0 {
+		return nil, fmt.Errorf("work dir %s is not a git repository and is not empty", path)
 	}
 	return git.InitRepository(path, true)
 }

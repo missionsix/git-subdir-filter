@@ -43,6 +43,13 @@ func TestLoadPrecedence(t *testing.T) {
 				TargetRepo: "ft", TargetBranch: "master", FilterDir: "d"},
 		},
 		{
+			// Regression: names starting with ".." were rejected as escaping the root.
+			name: "dot-dot prefixed name",
+			args: []string{"-source-repo=s", "-target-repo=t", "-filter-dir=..assets"},
+			want: Config{WorkDir: "work", SourceRepo: "s", SourceBranch: "master",
+				TargetRepo: "t", TargetBranch: "master", FilterDir: "..assets"},
+		},
+		{
 			name: "filter dir normalized",
 			args: []string{"-source-repo=s", "-target-repo=t", "-filter-dir=/lib//foo/"},
 			want: Config{WorkDir: "work", SourceRepo: "s", SourceBranch: "master",

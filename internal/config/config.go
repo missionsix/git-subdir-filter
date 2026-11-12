@@ -97,7 +97,7 @@ func (c *Config) validate() error {
 // "/lib//foo/" -> "lib/foo". It rejects the root and paths escaping it.
 func CleanPrefix(p string) (string, error) {
 	c := strings.Trim(path.Clean("/"+p), "/")
-	if c == "" || strings.HasPrefix(path.Clean(p), "..") {
+	if rel := path.Clean(p); c == "" || rel == ".." || strings.HasPrefix(rel, "../") {
 		return "", fmt.Errorf("-filter-dir %q must name a subdirectory", p)
 	}
 	return c, nil

@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -35,6 +36,7 @@ type Splitter struct {
 	Log      *slog.Logger
 
 	mapping   map[git.Oid]git.Oid
+	added     []git.Oid           // source commits mapped this run, in order
 	treeOf    map[git.Oid]git.Oid // rewritten commit -> its tree
 	emptyTree *git.Oid
 }
@@ -46,13 +48,15 @@ type Result struct {
 	Created int      // rewritten commits written this run
 }
 
-// StateLocations returns per-prefix resume state paths, so several prefixes
-// can share one work directory. Example: ("work", "lib/foo") ->
-// ("work/split-<12 hex>.map", "refs/subdir-filter/<12 hex>/source-tip").
-func StateLocations(workDir, prefix string) (mapPath, stateRef string) {
-	sum := sha1.Sum([]byte(prefix))
-	id := hex.EncodeToString(sum[:])[:12]
-	return filepath.Join(workDir, "split-"+id+".map"), "refs/subdir-filter/" + id + "/source-tip"
+// StateLocations returns resume state paths keyed by source URL, branch and
+// prefix, so several jobs can share one work directory. refNS is a ref
+// namespace for that job's other refs. Example:
+// ("work", "git@h:mono.git", "main", "lib/foo") ->
+// ("work/split-<16 hex>.map", "refs/subdir-filter/<16 hex>/").
+func StateLocations(workDir, sourceURL, sourceBranch, prefix string) (mapPath, refNS string) {
+	sum := sha1.Sum([]byte(sourceURL + "\x00" + sourceBranch + "\x00" + prefix))
+	id := hex.EncodeToString(sum[:])[:16]
+	return filepath.Join(workDir, "split-"+id+".map"), "refs/subdir-filter/" + id + "/"
 }
 
 // Split rewrites every commit reachable from sourceTip that previous runs
@@ -67,6 +71,7 @@ func (s *Splitter) Split(ctx context.Context, sourceTip *git.Oid) (Result, error
 	if err := s.loadMapping(); err != nil {
 		return res, err
 	}
+	s.added = nil
 	s.treeOf = make(map[git.Oid]git.Oid)
 
 	walk, err := s.Repo.Walk()
@@ -78,7 +83,8 @@ func (s *Splitter) Split(ctx context.Context, sourceTip *git.Oid) (Result, error
 	if err := walk.Push(sourceTip); err != nil {
 		return res, fmt.Errorf("walk from %s: %w", sourceTip, err)
 	}
-	if prev := s.previousTip(); prev != nil {
+	prev := s.previousTip()
+	if prev != nil {
 		// Mapping is saved before the ref, so prev's ancestry is fully mapped.
 		log.Info("resuming", "previous_tip", prev.String())
 		if err := walk.Hide(prev); err != nil {
@@ -110,7 +116,8 @@ func (s *Splitter) Split(ctx context.Context, sourceTip *git.Oid) (Result, error
 	if head := s.mapping[*sourceTip]; head != zero {
 		res.Head = &head
 	}
-	if err := s.saveMapping(); err != nil {
+	// Incremental runs append; a full run rewrites, dropping stale entries.
+	if err := s.saveMapping(prev != nil); err != nil {
 		return res, err
 	}
 	if _, err := s.Repo.References.Create(s.StateRef, sourceTip, true, "subdir-filter resume"); err != nil {
@@ -140,7 +147,7 @@ func (s *Splitter) rewrite(id *git.Oid) (bool, error) {
 	}
 	if sub == nil {
 		if len(parents) == 0 {
-			s.mapping[*id] = zero // prefix hasn't appeared yet
+			s.record(id, zero) // prefix hasn't appeared yet
 			return false, nil
 		}
 		// Prefix removed: record it as an empty tree so the deletion shows.
@@ -155,7 +162,7 @@ func (s *Splitter) rewrite(id *git.Oid) (bool, error) {
 			return false, err
 		}
 		if pt.Equal(sub) {
-			s.mapping[*id] = *parents[0] // no change under prefix: prune
+			s.record(id, *parents[0]) // no change under prefix: prune
 			return false, nil
 		}
 	}
@@ -165,7 +172,7 @@ func (s *Splitter) rewrite(id *git.Oid) (bool, error) {
 	if err != nil {
 		return false, err
 	}
-	s.mapping[*id] = *nid
+	s.record(id, *nid)
 	s.treeOf[*nid] = *sub
 	return true, nil
 }
@@ -283,6 +290,13 @@ func (s *Splitter) previousTip() *git.Oid {
 	return t
 }
 
+func (s *Splitter) record(src *git.Oid, dst git.Oid) {
+	s.mapping[*src] = dst
+	s.added = append(s.added, *src)
+}
+
+// loadMapping reads MapPath. A torn last line (from a crash mid-append) is
+// truncated away; its commits are re-walked because StateRef wasn't updated.
 func (s *Splitter) loadMapping() error {
 	s.mapping = make(map[git.Oid]git.Oid)
 	f, err := os.Open(s.MapPath)
@@ -294,36 +308,55 @@ func (s *Splitter) loadMapping() error {
 	}
 	defer f.Close()
 
-	sc := bufio.NewScanner(f)
-	for n := 1; sc.Scan(); n++ {
-		src, dst, ok := strings.Cut(sc.Text(), " ")
+	r := bufio.NewReader(f)
+	var good int64
+	for n := 1; ; n++ {
+		line, err := r.ReadString('\n')
+		if errors.Is(err, io.EOF) {
+			if line != "" {
+				return os.Truncate(s.MapPath, good)
+			}
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		src, dst, ok := strings.Cut(strings.TrimSuffix(line, "\n"), " ")
 		a, errA := git.NewOid(src)
 		b, errB := git.NewOid(dst)
 		if !ok || errA != nil || errB != nil {
 			return fmt.Errorf("%s:%d: malformed mapping line", s.MapPath, n)
 		}
 		s.mapping[*a] = *b
+		good += int64(len(line))
 	}
-	return sc.Err()
 }
 
-// saveMapping writes the mapping atomically (temp file + rename).
-func (s *Splitter) saveMapping() error {
+// saveMapping appends this run's entries, or rewrites the whole mapping
+// atomically (temp file + rename) when appendOnly is false.
+func (s *Splitter) saveMapping(appendOnly bool) error {
+	if appendOnly {
+		f, err := os.OpenFile(s.MapPath, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0o644)
+		if err != nil {
+			return err
+		}
+		if err := s.writeEntries(f, s.added); err != nil {
+			f.Close()
+			return err
+		}
+		return f.Close()
+	}
+
 	tmp, err := os.CreateTemp(filepath.Dir(s.MapPath), filepath.Base(s.MapPath)+".*")
 	if err != nil {
 		return err
 	}
 	defer os.Remove(tmp.Name())
-
-	w := bufio.NewWriter(tmp)
-	for src, dst := range s.mapping {
-		fmt.Fprintf(w, "%s %s\n", src.String(), dst.String())
+	all := make([]git.Oid, 0, len(s.mapping))
+	for src := range s.mapping {
+		all = append(all, src)
 	}
-	if err := w.Flush(); err != nil {
-		tmp.Close()
-		return err
-	}
-	if err := tmp.Sync(); err != nil {
+	if err := s.writeEntries(tmp, all); err != nil {
 		tmp.Close()
 		return err
 	}
@@ -331,4 +364,16 @@ func (s *Splitter) saveMapping() error {
 		return err
 	}
 	return os.Rename(tmp.Name(), s.MapPath)
+}
+
+func (s *Splitter) writeEntries(f *os.File, srcs []git.Oid) error {
+	w := bufio.NewWriter(f)
+	for _, src := range srcs {
+		dst := s.mapping[src]
+		fmt.Fprintf(w, "%s %s\n", src.String(), dst.String())
+	}
+	if err := w.Flush(); err != nil {
+		return err
+	}
+	return f.Sync()
 }

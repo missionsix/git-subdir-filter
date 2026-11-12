@@ -3,6 +3,7 @@
 package remote
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -41,14 +42,16 @@ func DefaultKeyPath(home string) string {
 	return ""
 }
 
-// Fetch fetches refspec from url through the remote called name.
-func Fetch(repo *git.Repository, name, url, refspec string, auth Auth) error {
-	r, err := ensure(repo, name, url)
+// Fetch fetches refspec from url. It uses an anonymous remote, so concurrent
+// runs against different URLs in one work directory don't interfere.
+// Cancelling ctx aborts the transfer.
+func Fetch(ctx context.Context, repo *git.Repository, url, refspec string, auth Auth) error {
+	r, err := repo.Remotes.CreateAnonymous(url)
 	if err != nil {
 		return err
 	}
 	defer r.Free()
-	cbs, err := auth.Callbacks(url)
+	cbs, err := auth.Callbacks(ctx, url)
 	if err != nil {
 		return err
 	}
@@ -58,33 +61,32 @@ func Fetch(repo *git.Repository, name, url, refspec string, auth Auth) error {
 	}, "")
 }
 
-// Push pushes refspec to url through the remote called name.
-func Push(repo *git.Repository, name, url, refspec string, auth Auth) error {
-	r, err := ensure(repo, name, url)
+// Push pushes refspec to url. A ref the server rejects (for example by a
+// protected-branch hook) is returned as an error.
+func Push(ctx context.Context, repo *git.Repository, url, refspec string, auth Auth) error {
+	r, err := repo.Remotes.CreateAnonymous(url)
 	if err != nil {
 		return err
 	}
 	defer r.Free()
-	cbs, err := auth.Callbacks(url)
+	cbs, err := auth.Callbacks(ctx, url)
 	if err != nil {
 		return err
 	}
+	cbs.PushUpdateReferenceCallback = rejectedRef
 	return r.Push([]string{refspec}, &git.PushOptions{RemoteCallbacks: cbs})
 }
 
-// ensure returns the named remote, creating it or updating its URL.
-func ensure(repo *git.Repository, name, url string) (*git.Remote, error) {
-	if _, err := repo.Remotes.Lookup(name); err != nil {
-		return repo.Remotes.Create(name, url)
+// rejectedRef turns a per-ref push status into an error; "" means accepted.
+func rejectedRef(refname, status string) error {
+	if status != "" {
+		return fmt.Errorf("remote rejected %s: %s", refname, status)
 	}
-	if err := repo.Remotes.SetUrl(name, url); err != nil {
-		return nil, err
-	}
-	return repo.Remotes.Lookup(name)
+	return nil
 }
 
 // Callbacks builds libgit2 callbacks for one remote URL.
-func (a Auth) Callbacks(remoteURL string) (git.RemoteCallbacks, error) {
+func (a Auth) Callbacks(ctx context.Context, remoteURL string) (git.RemoteCallbacks, error) {
 	var hostCB ssh.HostKeyCallback
 	if !a.InsecureSkipHostCheck && isSSH(remoteURL) {
 		var files []string
@@ -106,6 +108,9 @@ func (a Auth) Callbacks(remoteURL string) (git.RemoteCallbacks, error) {
 
 	return git.RemoteCallbacks{
 		CredentialsCallback: a.credentials(),
+		// libgit2 polls these during transfers; an error aborts it.
+		TransferProgressCallback:     func(git.TransferProgress) error { return ctx.Err() },
+		PushTransferProgressCallback: func(uint32, uint32, uint) error { return ctx.Err() },
 		CertificateCheckCallback: func(cert *git.Certificate, valid bool, host string) error {
 			return checkCert(cert, valid, host, port, hostCB, a.InsecureSkipHostCheck)
 		},
@@ -174,7 +179,13 @@ func isSSH(u string) bool {
 	if strings.HasPrefix(u, "ssh://") || strings.HasPrefix(u, "git+ssh://") || strings.HasPrefix(u, "ssh+git://") {
 		return true
 	}
-	return !strings.Contains(u, "://") && strings.Contains(u, ":")
+	if strings.Contains(u, "://") {
+		return false
+	}
+	// As in git, scp-style needs a colon before any slash, so "./a:b" is local.
+	colon := strings.Index(u, ":")
+	slash := strings.Index(u, "/")
+	return colon > 0 && (slash < 0 || colon < slash)
 }
 
 // sshPort returns the port from an ssh:// URL, or 22.

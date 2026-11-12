@@ -83,10 +83,14 @@ func (f *fixture) tree(files map[string]string) *git.Oid {
 	return id
 }
 
+func (f *fixture) splitter(prefix string) *Splitter {
+	mp, ns := StateLocations(f.dir, "src", "main", prefix)
+	return &Splitter{Repo: f.repo, Prefix: prefix, MapPath: mp, StateRef: ns + "source-tip"}
+}
+
 func (f *fixture) split(prefix string, tip *git.Oid) Result {
 	f.t.Helper()
-	mp, ref := StateLocations(f.dir, prefix)
-	s := &Splitter{Repo: f.repo, Prefix: prefix, MapPath: mp, StateRef: ref}
+	s := f.splitter(prefix)
 	res, err := s.Split(context.Background(), tip)
 	if err != nil {
 		f.t.Fatalf("Split: %v", err)
@@ -233,11 +237,46 @@ func TestIncrementalIsStableAndMatchesFullRun(t *testing.T) {
 	}
 
 	// Losing resume state must reproduce identical OIDs.
-	mp, _ := StateLocations(f.dir, "lib/foo")
-	must(t, os.Remove(mp))
+	must(t, os.Remove(f.splitter("lib/foo").MapPath))
 	full := f.split("lib/foo", c4)
 	if !full.Head.Equal(second.Head) || full.Visited != 4 {
 		t.Errorf("full re-run head %s visited %d, want %s visited 4", full.Head, full.Visited, second.Head)
+	}
+}
+
+func TestMappingAppendsAndRepairsTornLine(t *testing.T) {
+	f := newFixture(t)
+	c1 := f.commit("add foo", map[string]string{"lib/foo/a": "1"})
+	c2 := f.commit("edit foo", map[string]string{"lib/foo/a": "2"}, c1)
+	first := f.split("lib/foo", c2)
+	mp := f.splitter("lib/foo").MapPath
+	before, err := os.ReadFile(mp)
+	must(t, err)
+
+	// Incremental run appends: existing bytes are untouched.
+	c3 := f.commit("edit again", map[string]string{"lib/foo/a": "3"}, c2)
+	second := f.split("lib/foo", c3)
+	after, err := os.ReadFile(mp)
+	must(t, err)
+	if !strings.HasPrefix(string(after), string(before)) || len(after) <= len(before) {
+		t.Fatalf("mapping not appended:\nbefore %q\nafter  %q", before, after)
+	}
+
+	// Simulate a crash mid-append: a partial line with no newline.
+	fh, err := os.OpenFile(mp, os.O_WRONLY|os.O_APPEND, 0)
+	must(t, err)
+	_, err = fh.WriteString("deadbeef")
+	must(t, err)
+	must(t, fh.Close())
+	c4 := f.commit("edit 4", map[string]string{"lib/foo/a": "4"}, c3)
+	third := f.split("lib/foo", c4)
+	head, err := f.repo.LookupCommit(third.Head)
+	must(t, err)
+	if !head.ParentId(0).Equal(second.Head) || first.Head == nil {
+		t.Fatalf("after torn line: parent %s, want %s", head.ParentId(0), second.Head)
+	}
+	if data, _ := os.ReadFile(mp); strings.Contains(string(data), "deadbeef") {
+		t.Fatal("torn line not truncated")
 	}
 }
 
@@ -246,12 +285,11 @@ func TestCancelled(t *testing.T) {
 	c1 := f.commit("add foo", map[string]string{"lib/foo/a": "1"})
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	mp, ref := StateLocations(f.dir, "lib/foo")
-	s := &Splitter{Repo: f.repo, Prefix: "lib/foo", MapPath: mp, StateRef: ref}
+	s := f.splitter("lib/foo")
 	if _, err := s.Split(ctx, c1); err != context.Canceled {
 		t.Fatalf("err = %v, want context.Canceled", err)
 	}
-	if _, err := os.Stat(mp); !os.IsNotExist(err) {
+	if _, err := os.Stat(s.MapPath); !os.IsNotExist(err) {
 		t.Errorf("mapping written despite cancel")
 	}
 }
